@@ -450,30 +450,31 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
     %% Generate Session Ticket if client supports it
-    {SessionTicket, TicketRecord, St0} = case HasSessionTicket of
+    {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
             Ticket = generate_session_ticket(Secret),
-            TicketRecord = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
-            {Ticket, TicketRecord, #st{session_ticket = Ticket, 
-                                       session_ticket_lifetime = 604800}};
+            TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
+            {Ticket, TicketRecord2};
         false ->
-            {undefined, <<>>, #st{}}
+            {undefined, <<>>}
     end,
     
     %% Generate OCSP response if client supports it
-    {OcspResponse, St} = case HasOcspStapling of
+    OcspResponse = case HasOcspStapling of
         true ->
-            Ocsp = generate_ocsp_response(ServerDigest),
-            {Ocsp, St0#st{ocsp_response = Ocsp}};
+            generate_ocsp_response(ServerDigest);
         false ->
-            {undefined, St0}
+            undefined
     end,
     
+    %% Build initial response without proper digest
     Response0 = [_, CC, DD, ST] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
          as_tls_frame(?TLS_REC_DATA, FakeHttpData),
          TicketRecord],
+    
+    %% Calculate digest with complete response
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
                               HasSessionTicket, HasOcspStapling),
@@ -481,12 +482,20 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                 CC,
                 DD,
                 ST],
+    
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
               client_digest => ClientDigest,
               sni_domain => SniDomain},
     Meta = Meta0#{session_ticket => SessionTicket,
                   ocsp_response => OcspResponse},
+    
+    St = #st{session_ticket = SessionTicket,
+             ocsp_response = OcspResponse,
+             session_ticket_lifetime = case HasSessionTicket of
+                                          true -> 604800;
+                                          false -> undefined
+                                      end},
     {ok, Response, Meta, St}.
 
 %% ============================================================================
@@ -1000,6 +1009,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     ExtensionsBase = [
         ECH,
         SessionTicketExt,                            % Session Ticket
+        EcPointExt,                                   % EC point formats
         <<16#44, 16#cd, 16#00, 16#05,
           16#00, 16#03, 16#02, $h, $2>>,             % application_layer_protocol_settings
         KeyShare,

@@ -452,6 +452,9 @@ derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 
     Derived.
 
 
+%% ============================================================================
+%% parse_client_hello - ORIGINAL VALIDATION
+%% ============================================================================
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloLen:?u24, ?TLS_12_VERSION,
                      Random:?DIGEST_LEN/binary,
@@ -459,7 +462,7 @@ parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      CipherSuitesLen:?u16, CipherSuites:CipherSuitesLen/binary,
                      CompMethodsLen, CompMethods:CompMethodsLen/binary,
                      ExtensionsLen:?u16, Extensions:ExtensionsLen/binary>>
-                  ) when TlsFrameLen >= 512, HelloLen >= 400 ->
+                  ) when TlsFrameLen >= 512, HelloLen >= 508 ->
     #client_hello{
        pseudorandom = Random,
        session_id = SessId,

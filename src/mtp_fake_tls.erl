@@ -1,9 +1,14 @@
 %%% @author sergey <me@seriyps.ru>
 %%% @copyright (C) 2019, sergey
 %%% @doc
-%%% Fake TLS 'CBC' stream codec
-%%% https://github.com/telegramdesktop/tdesktop/commit/69b6b487382c12efc43d52f472cab5954ab850e2
-%%% It's not real TLS, but it looks like TLS1.3 from outside
+%%% Fake TLS 'CBC' stream codec with advanced security features:
+%%% - Random TLS Fingerprint (6 browser profiles)
+%%% - Anti-Replay Protection (timestamp + nonce)
+%%% - GREASE Randomization
+%%% - Random Padding & Record Sizing
+%%% - Fake Session Ticket, OCSP, SCT
+%%% - JA4 Fingerprint Randomization
+%%% - Domain Restriction with Wildcard Support
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -25,6 +30,7 @@
 -export([make_client_hello/2,
          make_client_hello/4,
          parse_server_hello/1]).
+-export([init_nonce_cache/0]).
 
 -export_type([codec/0, meta/0]).
 
@@ -66,6 +72,8 @@
 
 -define(TLS_TAG_CLI_HELLO, 1).
 -define(TLS_TAG_SRV_HELLO, 2).
+-define(TLS_TAG_CERTIFICATE_STATUS, 22).
+-define(TLS_TAG_SESSION_TICKET, 4).
 -define(TLS_CIPHERSUITE, 192, 47).
 -define(TLS_CHANGE_CIPHER, ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1).
 
@@ -75,6 +83,7 @@
 -define(EXT_SUPPORTED_VERSIONS, 43).
 
 -define(APP, mtproto_proxy).
+-define(NONCE_CACHE_TABLE, tls_nonce_cache).
 
 %% ============================================================================
 %% Random TLS Fingerprint Profiles
@@ -117,7 +126,8 @@
       sig_algorithms_count => 15,
       ec_point_formats => true,
       compress_certificate => brotli,
-      ech_payload_size => 176
+      ech_payload_size => 176,
+      alpn_protocols => [<<"h2">>, <<"http/1.1">>]
     },
     #{name => firefox_121,
       cipher_suites => [
@@ -137,13 +147,13 @@
           16#00, 16#9d,
           16#00, 16#2f,
           16#00, 16#35,
-          16#00, 16#3c,   % TLS_RSA_WITH_AES_128_CBC_SHA256
-          16#00, 16#3d    % TLS_RSA_WITH_AES_256_CBC_SHA384
+          16#00, 16#3c,
+          16#00, 16#3d
       ],
       key_share_groups => [
           16#ea, 16#ea,
-          16#00, 16#1d,   % x25519
-          16#00, 16#17    % secp256r1
+          16#00, 16#1d,
+          16#00, 16#17
       ],
       supported_versions => [
           16#ea, 16#ea,
@@ -153,7 +163,8 @@
       sig_algorithms_count => 17,
       ec_point_formats => true,
       compress_certificate => brotli,
-      ech_payload_size => 144
+      ech_payload_size => 144,
+      alpn_protocols => [<<"h2">>, <<"http/1.1">>, <<"http/1.0">>]
     },
     #{name => safari_17,
       cipher_suites => [
@@ -172,19 +183,20 @@
       ],
       key_share_groups => [
           16#ea, 16#ea,
-          16#00, 16#1d,   % x25519
-          16#00, 16#17,   % secp256r1
-          16#00, 16#18,   % secp384r1
-          16#00, 16#19    % secp521r1
+          16#00, 16#1d,
+          16#00, 16#17,
+          16#00, 16#18,
+          16#00, 16#19
       ],
       supported_versions => [
           16#ea, 16#ea,
-          16#03, 16#04    % فقط TLS 1.3 (Safari 17 dropped TLS 1.2)
+          16#03, 16#04
       ],
       sig_algorithms_count => 13,
       ec_point_formats => false,
       compress_certificate => none,
-      ech_payload_size => 208
+      ech_payload_size => 208,
+      alpn_protocols => [<<"h2">>, <<"http/1.1">>]
     },
     #{name => edge_120,
       cipher_suites => [
@@ -207,9 +219,9 @@
       ],
       key_share_groups => [
           16#ea, 16#ea,
-          16#11, 16#ec,   % X25519MLKEM768
-          16#00, 16#1d,   % x25519
-          16#00, 16#17    % secp256r1
+          16#11, 16#ec,
+          16#00, 16#1d,
+          16#00, 16#17
       ],
       supported_versions => [
           16#ea, 16#ea,
@@ -219,7 +231,8 @@
       sig_algorithms_count => 16,
       ec_point_formats => true,
       compress_certificate => brotli,
-      ech_payload_size => 176
+      ech_payload_size => 176,
+      alpn_protocols => [<<"h2">>, <<"http/1.1">>]
     },
     #{name => ios_17,
       cipher_suites => [
@@ -240,10 +253,10 @@
       ],
       key_share_groups => [
           16#ea, 16#ea,
-          16#11, 16#ec,   % X25519MLKEM768
-          16#00, 16#1d,   % x25519
-          16#00, 16#17,   % secp256r1
-          16#00, 16#19    % secp521r1 (iOS specific)
+          16#11, 16#ec,
+          16#00, 16#1d,
+          16#00, 16#17,
+          16#00, 16#19
       ],
       supported_versions => [
           16#ea, 16#ea,
@@ -253,7 +266,8 @@
       sig_algorithms_count => 15,
       ec_point_formats => true,
       compress_certificate => brotli,
-      ech_payload_size => 208
+      ech_payload_size => 208,
+      alpn_protocols => [<<"h2">>, <<"http/1.1">>]
     },
     #{name => brave_120,
       cipher_suites => [
@@ -273,14 +287,14 @@
           16#00, 16#9d,
           16#00, 16#2f,
           16#00, 16#35,
-          16#00, 16#ff    % TLS_EMPTY_RENEGOTIATION_INFO_SCSV (Brave specific)
+          16#00, 16#ff
       ],
       key_share_groups => [
           16#ea, 16#ea,
-          16#00, 16#1d,   % x25519
-          16#00, 16#17,   % secp256r1
-          16#00, 16#18,   % secp384r1
-          16#00, 16#19    % secp521r1
+          16#00, 16#1d,
+          16#00, 16#17,
+          16#00, 16#18,
+          16#00, 16#19
       ],
       supported_versions => [
           16#ea, 16#ea,
@@ -290,7 +304,8 @@
       sig_algorithms_count => 14,
       ec_point_formats => true,
       compress_certificate => brotli,
-      ech_payload_size => 176
+      ech_payload_size => 176,
+      alpn_protocols => [<<"h2">>, <<"http/1.1">>]
     }
 ]).
 
@@ -303,9 +318,57 @@
 
 
 %% ============================================================================
-%% @doc Randomly select a TLS fingerprint profile
-%% @end
+%% NONCE CACHE INITIALIZATION
 %% ============================================================================
+
+-spec init_nonce_cache() -> ok.
+init_nonce_cache() ->
+    case ets:info(?NONCE_CACHE_TABLE) of
+        undefined ->
+            ets:new(?NONCE_CACHE_TABLE, [
+                named_table,
+                public,
+                set,
+                {write_concurrency, true},
+                {read_concurrency, true}
+            ]),
+            ?LOG_INFO("TLS nonce cache initialized"),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% ============================================================================
+%% GREASE & RANDOMIZATION HELPERS
+%% ============================================================================
+
+grease_value() ->
+    GreaseValues = [
+        16#0A0A, 16#1A1A, 16#2A2A, 16#3A3A, 16#4A4A,
+        16#5A5A, 16#6A6A, 16#7A7A, 16#8A8A, 16#9A9A,
+        16#AAAA, 16#BABA, 16#CACA, 16#DADA, 16#EAEA, 16#FAFA
+    ],
+    lists:nth(rand:uniform(length(GreaseValues)), GreaseValues).
+
+is_grease(16#ea, 16#ea) -> true;
+is_grease(A, B) ->
+    %% Check if it's any GREASE value
+    lists:member([A, B], [
+        [16#0A, 16#0A], [16#1A, 16#1A], [16#2A, 16#2A],
+        [16#3A, 16#3A], [16#4A, 16#4A], [16#5A, 16#5A],
+        [16#6A, 16#6A], [16#7A, 16#7A], [16#8A, 16#8A],
+        [16#9A, 16#9A], [16#AA, 16#AA], [16#BA, 16#BA],
+        [16#CA, 16#CA], [16#DA, 16#DA], [16#EA, 16#EA],
+        [16#FA, 16#FA]
+    ]).
+
+chunk_groups([]) -> [];
+chunk_groups([A, B | Rest]) -> [[A, B] | chunk_groups(Rest)].
+
+%% ============================================================================
+%% TLS FINGERPRINT PROFILE FUNCTIONS
+%% ============================================================================
+
 -spec random_tls_profile() -> map().
 random_tls_profile() ->
     Profiles = ?TLS_FINGERPRINT_PROFILES,
@@ -313,18 +376,18 @@ random_tls_profile() ->
     ?LOG_DEBUG("Selected TLS fingerprint: ~s", [maps:get(name, Profile, unknown)]),
     Profile.
 
-%% ============================================================================
-%% @doc Build cipher suites binary from profile
-%% @end
-%% ============================================================================
 -spec build_cipher_suites(map()) -> binary().
 build_cipher_suites(#{cipher_suites := Suites}) ->
     << <<S:?u16>> || S <- Suites >>.
 
-%% ============================================================================
-%% @doc Build key share entries from profile
-%% @end
-%% ============================================================================
+-spec key_size_for_group(non_neg_integer()) -> non_neg_integer().
+key_size_for_group(16#001D) -> 32;
+key_size_for_group(16#0017) -> 32;
+key_size_for_group(16#0018) -> 48;
+key_size_for_group(16#0019) -> 64;
+key_size_for_group(16#11EC) -> 1184;
+key_size_for_group(_) -> 32.
+
 -spec build_key_share_entries(map()) -> binary().
 build_key_share_entries(#{key_share_groups := Groups}) ->
     GreaseEntry = <<16#ea, 16#ea, 16#00, 16#01, 16#00>>,
@@ -340,62 +403,26 @@ build_key_share_entries(#{key_share_groups := Groups}) ->
     ],
     iolist_to_binary([GreaseEntry | RealEntries]).
 
-%% ============================================================================
-%% @doc Get key size for a given TLS group
-%% @end
-%% ============================================================================
--spec key_size_for_group(non_neg_integer()) -> non_neg_integer().
-key_size_for_group(16#001D) -> 32;   % x25519
-key_size_for_group(16#0017) -> 32;   % secp256r1
-key_size_for_group(16#0018) -> 48;   % secp384r1
-key_size_for_group(16#0019) -> 64;   % secp521r1
-key_size_for_group(16#11EC) -> 1184; % X25519MLKEM768
-key_size_for_group(_) -> 32.
-
-%% ============================================================================
-%% @doc Build supported versions extension from profile
-%% @end
-%% ============================================================================
 -spec build_supported_versions_ext(map()) -> binary().
 build_supported_versions_ext(#{supported_versions := Versions}) ->
     << <<V:?u16>> || V <- Versions >>.
 
-%% ============================================================================
-%% @doc Build signature algorithms from profile
-%% @end
-%% ============================================================================
 -spec build_sig_algos(map()) -> binary().
 build_sig_algos(#{sig_algorithms_count := Count}) ->
-    %% Common signature algorithms pool
     AllAlgos = [
-        16#04, 16#03,   % ecdsa_secp256r1_sha256
-        16#05, 16#03,   % ecdsa_secp384r1_sha384
-        16#06, 16#03,   % ecdsa_secp521r1_sha512
-        16#02, 16#03,   % ecdsa_sha1
-        16#08, 16#04,   % rsa_pss_rsae_sha256
-        16#08, 16#05,   % rsa_pss_rsae_sha384
-        16#08, 16#06,   % rsa_pss_rsae_sha512
-        16#04, 16#01,   % rsa_pkcs1_sha256
-        16#05, 16#01,   % rsa_pkcs1_sha384
-        16#06, 16#01,   % rsa_pkcs1_sha512
-        16#02, 16#01,   % rsa_pkcs1_sha1
-        16#04, 16#02,
-        16#03, 16#02,
-        16#02, 16#02,
-        16#03, 16#01
+        16#04, 16#03, 16#05, 16#03, 16#06, 16#03, 16#02, 16#03,
+        16#08, 16#04, 16#08, 16#05, 16#08, 16#06,
+        16#04, 16#01, 16#05, 16#01, 16#06, 16#01, 16#02, 16#01,
+        16#04, 16#02, 16#03, 16#02, 16#02, 16#02, 16#03, 16#01
     ],
     Selected = lists:sublist(AllAlgos, Count * 2),
     AlgoListLen = Count * 2,
     ExtLen = AlgoListLen + 2,
-    <<16#00, 16#0d,             % signature_algorithms
-      ExtLen:?u16,               % ext length
-      AlgoListLen:?u16,          % list length
+    <<16#00, 16#0d,
+      ExtLen:?u16,
+      AlgoListLen:?u16,
       << <<A:8>> || A <- Selected >>/binary>>.
 
-%% ============================================================================
-%% @doc Build ECH extension from profile
-%% @end
-%% ============================================================================
 -spec build_ech(map()) -> binary().
 build_ech(#{ech_payload_size := PayloadSize}) ->
     EchRand1 = crypto:strong_rand_bytes(1),
@@ -412,32 +439,48 @@ build_ech(#{ech_payload_size := PayloadSize}) ->
       (byte_size(EchContent)):?u16,
       EchContent/binary>>.
 
-%% ============================================================================
-%% @doc Build compress_certificate extension from profile
-%% @end
-%% ============================================================================
 -spec build_compress_certificate(atom()) -> binary().
 build_compress_certificate(brotli) ->
     <<16#00, 16#1b, 16#00, 16#03, 16#02, 16#00, 16#02>>;
 build_compress_certificate(none) ->
     <<>>.
 
-%% ============================================================================
-%% @doc Build ec_point_formats extension if profile uses it
-%% @end
-%% ============================================================================
 -spec build_ec_point_formats(boolean()) -> binary().
 build_ec_point_formats(true) ->
     <<16#00, 16#0b, 16#00, 16#02, 16#01, 16#00>>;
 build_ec_point_formats(false) ->
     <<>>.
 
-%% Helpers
-chunk_groups([]) -> [];
-chunk_groups([A, B | Rest]) -> [[A, B] | chunk_groups(Rest)].
+-spec build_alpn_ext(map()) -> binary().
+build_alpn_ext(#{alpn_protocols := Protocols}) ->
+    AlpnData = << <<(byte_size(P)):8, P/binary>> || P <- Protocols >>,
+    <<16#00, 16#10,
+      (byte_size(AlpnData) + 2):?u16,
+      (byte_size(AlpnData)):?u16,
+      AlpnData/binary>>.
 
-is_grease(16#ea, 16#ea) -> true;
-is_grease(_, _) -> false.
+-spec build_random_grease_extensions() -> [binary()].
+build_random_grease_extensions() ->
+    Count = rand:uniform(3),
+    [
+        begin
+            GreaseType = grease_value(),
+            case rand:uniform(3) of
+                1 -> <<GreaseType:16, 0:16>>;
+                2 -> <<GreaseType:16, 1:16, 0:8>>;
+                _ -> <<GreaseType:16, 2:16, 16#00, 16#00>>
+            end
+        end
+        || _ <- lists:seq(1, Count)
+    ].
+
+-spec insert_random_grease([iodata()], [binary()]) -> [iodata()].
+insert_random_grease(Extensions, []) ->
+    Extensions;
+insert_random_grease(Extensions, [Grease | Rest]) ->
+    Pos = rand:uniform(length(Extensions) + 1) - 1,
+    NewExts = lists:sublist(Extensions, Pos) ++ [Grease] ++ lists:nthtail(Pos, Extensions),
+    insert_random_grease(NewExts, Rest).
 
 
 %% @doc format TLS secret
@@ -460,10 +503,9 @@ urlencode_digit($+) -> $-;
 urlencode_digit(D)  -> D.
 
 %% ============================================================================
-%% @doc Check if a domain is allowed based on the allowed domains list.
-%% Supports exact match and wildcard patterns like "*.example.com".
-%% @end
+%% DOMAIN RESTRICTION
 %% ============================================================================
+
 -spec is_domain_allowed(binary(), [binary()]) -> boolean().
 is_domain_allowed(_Domain, []) ->
     true;
@@ -491,10 +533,9 @@ match_domain(Domain, Allowed) ->
     end.
 
 %% ============================================================================
-%% @doc Parse fake-TLS "ClientHello" packet and generate "ServerHello + ChangeCipher + ApplicationData"
-%% This is the version WITH domain checking.
-%% @end
+%% MAIN from_client_hello WITH ALL SECURITY FEATURES
 %% ============================================================================
+
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret, AllowedDomains) ->
@@ -503,13 +544,14 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                   extensions = Extensions} = CliHlo = parse_client_hello(Data),
     ?LOG_DEBUG("TLS ClientHello=~p", [CliHlo]),
 
-    %% Extract SNI domain
+    %% ============================================================
+    %% SECURITY: Extract SNI domain & check restriction
+    %% ============================================================
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
         {_, [{?EXT_SNI_HOST_NAME, Domain}]} -> Domain;
         _ -> undefined
     end,
 
-    %% Check if domain is allowed
     case SniDomain of
         undefined ->
             ?LOG_WARNING("TLS ClientHello has no SNI, rejecting"),
@@ -527,40 +569,98 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             end
     end,
 
+    %% ============================================================
+    %% SECURITY: Verify HMAC
+    %% ============================================================
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
         crypto:exor(ClientDigest, ServerDigest),
     lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
         error({protocol_error, tls_invalid_digest, XoredDigest}),
+
+    %% ============================================================
+    %% SECURITY: Anti-Replay - Timestamp Freshness Check
+    %% ============================================================
+    MaxAge = application:get_env(?APP, tls_timestamp_max_age_sec, 300),
+    Now = erlang:system_time(second),
+    case abs(Now - Timestamp) > MaxAge of
+        true ->
+            ?LOG_WARNING("Expired timestamp in ClientHello: ~p seconds old", 
+                         [abs(Now - Timestamp)]),
+            error({protocol_error, tls_expired_timestamp, Timestamp});
+        false ->
+            ok
+    end,
+
+    %% ============================================================
+    %% SECURITY: Anti-Replay - Nonce Check
+    %% ============================================================
+    init_nonce_cache(),
+    NonceKey = crypto:hash(sha256, ClientDigest),
+    case ets:insert_new(?NONCE_CACHE_TABLE, {NonceKey, Now}) of
+        true ->
+            ok;
+        false ->
+            ?LOG_WARNING("Replay attack detected! Duplicate ClientHello nonce"),
+            error({protocol_error, tls_replay_detected, NonceKey})
+    end,
+
+    %% ============================================================
+    %% BUILD RESPONSE
+    %% ============================================================
     KeyShare = make_key_share(Extensions),
+
+    %% ServerHello 0 (for HMAC calculation)
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
+
     Response0 = [_, CC, DD] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
          as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
+
+    %% Final ServerHello with correct digest
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
+
+    %% ============================================================
+    %% SECURITY: Fake Session Ticket
+    %% ============================================================
+    SessionTicket = crypto:strong_rand_bytes(rand:uniform(128) + 64),
+    SessionTicketFrame = as_tls_frame(?TLS_REC_HANDSHAKE, [
+        <<?TLS_TAG_SESSION_TICKET:8, (byte_size(SessionTicket)):?u24,
+           SessionTicket/binary>>
+    ]),
+
+    %% ============================================================
+    %% SECURITY: Fake OCSP Stapling
+    %% ============================================================
+    OcspResponse = crypto:strong_rand_bytes(rand:uniform(256) + 64),
+    OcspFrame = as_tls_frame(?TLS_REC_HANDSHAKE, [
+        <<?TLS_TAG_CERTIFICATE_STATUS:8, (byte_size(OcspResponse)):?u24,
+           OcspResponse/binary>>
+    ]),
+
+    %% ============================================================
+    %% FINAL RESPONSE
+    %% ============================================================
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
-                DD],
+                DD,
+                SessionTicketFrame,
+                OcspFrame],
+
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
               client_digest => ClientDigest},
     Meta = Meta0#{sni_domain => SniDomain},
     {ok, Response, Meta, new()}.
 
-%% ============================================================================
-%% @doc Backward-compatible version without domain checking.
-%% Calls from_client_hello/3 with empty domain list (all domains allowed).
-%% @end
-%% ============================================================================
 -spec from_client_hello(binary(), binary()) ->
                                {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret) ->
     from_client_hello(Data, Secret, []).
 
-%% Extract the SNI domain from a raw ClientHello binary without validating the secret.
 -spec parse_sni(binary()) -> {ok, binary()} | {error, no_sni | bad_hello}.
 parse_sni(Data) ->
     try
@@ -576,12 +676,10 @@ parse_sni(Data) ->
             {error, bad_hello}
     end.
 
-%% TLS fatal decode_error alert (RFC 8446 §6).
 -spec tls_decode_error_alert() -> binary().
 tls_decode_error_alert() ->
     <<?TLS_REC_ALERT, ?TLS_12_VERSION, 0, 2, ?TLS_ALERT_FATAL, ?TLS_ALERT_DECODE_ERROR>>.
 
-%% Derive a per-SNI 16-byte secret from the base secret, SNI domain and a salt.
 -spec derive_sni_secret(BaseSecret :: binary(), SniDomain :: binary(), Salt :: binary())
         -> binary().
 derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 ->
@@ -591,14 +689,13 @@ derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 
     Derived.
 
 
-parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16, %Frame
+parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloLen:?u24, ?TLS_12_VERSION,
                      Random:?DIGEST_LEN/binary,
                      SessIdLen, SessId:SessIdLen/binary,
                      CipherSuitesLen:?u16, CipherSuites:CipherSuitesLen/binary,
                      CompMethodsLen, CompMethods:CompMethodsLen/binary,
                      ExtensionsLen:?u16, Extensions:ExtensionsLen/binary>>
-                     %% _/binary>>
                   ) when TlsFrameLen >= 512, HelloLen >= 400 ->
     #client_hello{
        pseudorandom = Random,
@@ -645,16 +742,10 @@ make_key_share(Exts) ->
                             andalso
                             lists:member(
                               Group, [
-                                      16#0017,  % secp256r1
-                                      16#0018,  % secp384r1
-                                      16#0019,  % secp521r1
-                                      16#001D,  % x25519
-                                      16#001E,  % x448
-                                      16#0100,  % ffdhe2048
-                                      16#0101,  % ffdhe3072
-                                      16#0102,  % ffdhe4096
-                                      16#0103,  % ffdhe6144
-                                      16#0104   % ffdhe8192
+                                      16#0017, 16#0018, 16#0019,
+                                      16#001D, 16#001E,
+                                      16#0100, 16#0101, 16#0102,
+                                      16#0103, 16#0104
                               ])
                            )
                   end, KeyShares),
@@ -685,7 +776,10 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
                    | Extensions],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
-%% Generate Fake-TLS "ClientHello" with random fingerprint.
+%% ============================================================================
+%% make_client_hello WITH RANDOM FINGERPRINT + GREASE + JA4
+%% ============================================================================
+
 make_client_hello(Secret, SniDomain) ->
     make_client_hello(erlang:system_time(second),
                       crypto:strong_rand_bytes(32),
@@ -696,91 +790,112 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain) when byte_size(Hex
 make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(SessionId) == 32,
                                                                 byte_size(Secret) == 16 ->
     %% ============================================================
-    %% Random TLS Fingerprint Profile Selection
+    %% Random TLS Fingerprint Profile
     %% ============================================================
     Profile = random_tls_profile(),
     ProfileName = maps:get(name, Profile, unknown),
 
     GREASE = <<16#ea, 16#ea>>,
 
-    %% Cipher suites from random profile
     CipherSuites = build_cipher_suites(Profile),
-
     SNI = make_sni([SniDomain]),
-
-    %% Signature algorithms from random profile
     SigAlgos = build_sig_algos(Profile),
 
-    %% Supported groups from random profile
+    %% Supported groups
     #{key_share_groups := KSGroups} = Profile,
     GroupEntries = [<<G:?u16>> || [G1, G2] <- chunk_groups(KSGroups),
                                   G <- [[G1, G2]]],
     GroupsBin = iolist_to_binary(GroupEntries),
     GroupsLen = byte_size(GroupsBin),
     SupportedGroups =
-        <<16#00, 16#0a,              % supported_groups
-          (GroupsLen + 2):?u16,       % ext length
-          GroupsLen:?u16,             % list length
+        <<16#00, 16#0a,
+          (GroupsLen + 2):?u16,
+          GroupsLen:?u16,
           GroupsBin/binary>>,
 
-    %% Supported versions from random profile
+    %% Supported versions
     SupportedVersionsExt = build_supported_versions_ext(Profile),
     VersionsLen = byte_size(SupportedVersionsExt),
     SupportedVersions =
-        <<16#00, 16#2b,              % supported_versions
-          (VersionsLen + 1):?u16,     % ext length
-          VersionsLen,                % list length
+        <<16#00, 16#2b,
+          (VersionsLen + 1):?u16,
+          VersionsLen,
           SupportedVersionsExt/binary>>,
 
-    %% Key share from random profile
+    %% Key share
     KeyShareEntries = build_key_share_entries(Profile),
     KSListLen = byte_size(KeyShareEntries),
     KeyShare =
-        <<16#00, 16#33,              % key_share
-          (KSListLen + 2):?u16,       % ext length
+        <<16#00, 16#33,
+          (KSListLen + 2):?u16,
           KSListLen:?u16,
           KeyShareEntries/binary>>,
 
-    %% ECH from random profile
+    %% ECH
     ECH = build_ech(Profile),
 
-    %% Compress certificate from random profile
+    %% Compress certificate
     CompCert = maps:get(compress_certificate, Profile, brotli),
     CompressCertExt = build_compress_certificate(CompCert),
 
-    %% EC point formats from random profile
+    %% EC point formats
     EcPoint = maps:get(ec_point_formats, Profile, true),
     EcPointExt = build_ec_point_formats(EcPoint),
 
-    %% Build extensions
+    %% ============================================================
+    %% Random ALPN
+    %% ============================================================
+    AlpnExt = build_alpn_ext(Profile),
+
+    %% ============================================================
+    %% Fake SCT (Signed Certificate Timestamp)
+    %% ============================================================
+    SctData = crypto:strong_rand_bytes(rand:uniform(64) + 32),
+    SctExt = <<16#00, 16#12, (byte_size(SctData)):?u16, SctData/binary>>,
+
+    %% ============================================================
+    %% Fake QUIC/HTTP3 indicator
+    %% ============================================================
+    QuicExt = case rand:uniform(4) of
+        1 -> <<>>;
+        _ -> <<16#00, 16#ff, 16#00, 16#02, 16#00, 16#01>>
+    end,
+
+    %% ============================================================
+    %% Build base extensions
+    %% ============================================================
     Extensions0 = [
-        <<GREASE/binary, 0:16>>,                     % leading GREASE
+        <<GREASE/binary, 0:16>>,
         <<16#00, 16#17, 0:16>>,                      % extended_master_secret
-        ECH,                                         % encrypted_client_hello
+        ECH,
         <<16#00, 16#23, 0:16>>,                      % session_ticket
-        EcPointExt,                                  % ec_point_formats (optional)
+        EcPointExt,
         <<16#44, 16#cd, 16#00, 16#05,
-          16#00, 16#03, 16#02, $h, $2>>,             % application_layer_protocol_settings
-        KeyShare,                                    % key_share
-        <<16#00, 16#12, 0:16>>,                      % signed_certificate_timestamp
-        SupportedGroups,                             % supported_groups
-        CompressCertExt,                             % compress_certificate (optional)
-        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,       % renegotiation_info
-        SigAlgos,                                    % signature_algorithms
+          16#00, 16#03, 16#02, $h, $2>>,
+        KeyShare,
+        SctExt,                                      % signed_certificate_timestamp
+        SupportedGroups,
+        CompressCertExt,
+        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,
+        SigAlgos,
         <<16#00, 16#05, 16#00, 16#05,
-          16#01, 0:32>>,                             % status_request (OCSP)
-        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>, % psk_key_exchange_modes
-        <<16#00, 16#10, 16#00, 16#0e,
-          16#00, 16#0c,
-          16#02, $h, $2,
-          16#08, $h, $t, $t, $p, $/, $1, $., $1>>,  % ALPN
-        SNI,                                         % server_name
-        SupportedVersions,                           % supported_versions
-        <<GREASE/binary, 16#00, 16#01, 16#00>>       % trailing GREASE
+          16#01, 0:32>>,
+        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>,
+        AlpnExt,
+        QuicExt,
+        SNI,
+        SupportedVersions,
+        <<GREASE/binary, 16#00, 16#01, 16#00>>
     ],
 
     %% Filter empty extensions
-    Extensions = [Ext || Ext <- Extensions0, Ext =/= <<>>],
+    Extensions1 = [Ext || Ext <- Extensions0, Ext =/= <<>>],
+
+    %% ============================================================
+    %% Insert random GREASE extensions
+    %% ============================================================
+    GreaseExts = build_random_grease_extensions(),
+    Extensions = insert_random_grease(Extensions1, GreaseExts),
 
     ExtBin = iolist_to_binary(Extensions),
     CSLen = byte_size(CipherSuites),
@@ -811,7 +926,7 @@ make_sni(Domains) ->
     ItemsLen = byte_size(SniListItems),
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
-%% Parses "ServerHello" (the one produced by from_client_hello/2).
+%% Parses "ServerHello"
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
@@ -830,19 +945,16 @@ parse_server_hello(_) ->
     {error, not_proxy_response}.
 
 -spec tls_records_complete(binary(), non_neg_integer()) -> boolean().
-tls_records_complete(_B, 0) ->
-    true;
+tls_records_complete(_B, 0) -> true;
 tls_records_complete(<<_T, _Mj, _Mn, Len:?u16, Rest/binary>>, N) when byte_size(Rest) >= Len ->
     <<_:Len/binary, Tail/binary>> = Rest,
     tls_records_complete(Tail, N - 1);
-tls_records_complete(_B, _N) ->
-    false.
+tls_records_complete(_B, _N) -> false.
 
 %% Data stream codec
 
 -spec new() -> codec().
-new() ->
-    #st{}.
+new() -> #st{}.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.
@@ -862,10 +974,8 @@ decode_all(Bin, St) ->
 
 decode_all(Bin, Acc, St0) ->
     case try_decode_packet(Bin, St0) of
-        {incomplete, St} ->
-            {Acc, Bin, St};
-        {ok, Data, Tail, St} ->
-            decode_all(Tail, <<Acc/binary, Data/binary>>, St)
+        {incomplete, St} -> {Acc, Bin, St};
+        {ok, Data, Tail, St} -> decode_all(Tail, <<Acc/binary, Data/binary>>, St)
     end.
 
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
@@ -886,9 +996,7 @@ as_tls_frame(Type, Data) ->
     [<<Type, ?TLS_12_VERSION, Size:?u16>> | Data].
 
 -if(?OTP_RELEASE >= 23).
-hmac(Algo, Key, Str) ->
-    crypto:mac(hmac, Algo, Key, Str).
+hmac(Algo, Key, Str) -> crypto:mac(hmac, Algo, Key, Str).
 -else.
-hmac(Algo, Key, Str) ->
-    crypto:hmac(Algo, Key, Str).
+hmac(Algo, Key, Str) -> crypto:hmac(Algo, Key, Str).
 -endif.

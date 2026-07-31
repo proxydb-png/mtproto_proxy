@@ -8,7 +8,7 @@
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 %%% Enhanced : 2024 with advanced evasion techniques
 
--module(mtp_fake_tls_ultra).
+-module(mtp_fake_tls).
 
 -behaviour(mtp_codec).
 
@@ -37,12 +37,12 @@
 -dialyzer(no_improper_lists).
 
 -record(st, {
-    profile_pool :: [map()],
+    profile_pool = [] :: [atom()],
     current_profile :: map(),
-    rotation_counter :: non_neg_integer(),
-    rotation_interval :: non_neg_integer(),
+    rotation_counter = 0 :: non_neg_integer(),
+    rotation_interval = 50 :: non_neg_integer(),
     session_tickets = [] :: [binary()],
-    timing_seed :: non_neg_integer()
+    timing_seed = 0 :: non_neg_integer()
 }).
 
 -record(client_hello,
@@ -87,6 +87,13 @@
 -define(EXT_SESSION_TICKET, 35).
 -define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
 -define(EXT_PRE_SHARED_KEY, 41).
+-define(EXT_ALPN, 16).
+-define(EXT_SIGNED_CERT_TIMESTAMP, 18).
+-define(EXT_SUPPORTED_GROUPS, 10).
+-define(EXT_EC_POINT_FORMATS, 11).
+-define(EXT_COMPRESS_CERTIFICATE, 27).
+-define(EXT_RENEGOTIATION_INFO, 65281).
+-define(EXT_STATUS_REQUEST, 5).
 
 -define(APP, mtproto_proxy).
 -define(DEFAULT_ROTATION_INTERVAL, 50).
@@ -103,12 +110,11 @@
 
 %% ============================================================================
 %% Ultra-Advanced TLS Fingerprint Profiles
-%% Extended with more browsers and dynamic characteristics
 %% ============================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
     #{name => chrome_120,
-      version => "120.0.6099.109",
+      version => <<"120.0.6099.109">>,
       cipher_suites => [
           16#13, 16#01,   % TLS_AES_128_GCM_SHA256
           16#13, 16#02,   % TLS_AES_256_GCM_SHA384
@@ -157,7 +163,7 @@
       record_size_limit => [16384, 16385]
     },
     #{name => firefox_121,
-      version => "121.0",
+      version => <<"121.0">>,
       cipher_suites => [
           16#13, 16#01,
           16#13, 16#02,
@@ -204,7 +210,7 @@
       record_size_limit => [16384]
     },
     #{name => safari_17,
-      version => "17.2",
+      version => <<"17.2">>,
       cipher_suites => [
           16#13, 16#01,
           16#13, 16#02,
@@ -246,7 +252,7 @@
       record_size_limit => [16384]
     },
     #{name => edge_120,
-      version => "120.0.2210.61",
+      version => <<"120.0.2210.61">>,
       cipher_suites => [
           16#13, 16#01,
           16#13, 16#02,
@@ -293,7 +299,7 @@
       record_size_limit => [16384, 16385]
     },
     #{name => brave_1_60,
-      version => "1.60.125",
+      version => <<"1.60.125">>,
       cipher_suites => [
           16#13, 16#01,
           16#13, 16#02,
@@ -336,7 +342,7 @@
       record_size_limit => [16384]
     },
     #{name => opera_106,
-      version => "106.0.4998.19",
+      version => <<"106.0.4998.19">>,
       cipher_suites => [
           16#13, 16#01,
           16#13, 16#02,
@@ -385,7 +391,7 @@
       record_size_limit => [16384, 16385]
     },
     #{name => vivaldi_6,
-      version => "6.5.3206.50",
+      version => <<"6.5.3206.50">>,
       cipher_suites => [
           16#13, 16#01,
           16#13, 16#02,
@@ -474,18 +480,17 @@ new() ->
 
 -spec rotate_profile() -> codec().
 rotate_profile() ->
-    St = new(),
-    St.
+    new().
 
 -spec get_current_profile() -> map().
 get_current_profile() ->
     St = new(),
     St#st.current_profile.
 
--spec set_profile_pool([atom()]) -> ok.
+-spec set_profile_pool([atom()]) -> ok | {error, no_valid_profiles}.
 set_profile_pool(ProfileNames) ->
-    ValidProfiles = [P || P <- ProfileNames, 
-                         lists:keymember(P, 2, [{maps:get(name, M), M} || M <- ?TLS_FINGERPRINT_PROFILES])],
+    AllValidNames = [maps:get(name, M) || M <- ?TLS_FINGERPRINT_PROFILES],
+    ValidProfiles = [P || P <- ProfileNames, lists:member(P, AllValidNames)],
     case ValidProfiles of
         [] ->
             {error, no_valid_profiles};
@@ -541,8 +546,8 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     KeyShare = make_key_share(Extensions),
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
     
-    %% Generate fake HTTP response with timing obfuscation
-    FakeHttpData = generate_fake_response(Extensions),
+    %% Generate fake HTTP response with random data
+    FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
     Response0 = [_, CC, DD] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
@@ -802,13 +807,6 @@ apply_timing_profile(#st{current_profile = Profile} = St) ->
 %% Internal Functions - Protocol Building
 %% ============================================================================
 
--spec random_tls_profile() -> map().
-random_tls_profile() ->
-    Profiles = ?TLS_FINGERPRINT_PROFILES,
-    Profile = lists:nth(rand:uniform(length(Profiles)), Profiles),
-    ?LOG_DEBUG("Selected TLS fingerprint: ~s", [maps:get(name, Profile, unknown)]),
-    Profile.
-
 -spec random_grease(non_neg_integer()) -> [non_neg_integer()].
 random_grease(Count) ->
     [lists:nth(rand:uniform(length(?GREASE_VALUES)), ?GREASE_VALUES) || _ <- lists:seq(1, Count)].
@@ -1021,16 +1019,6 @@ generate_session_ticket(Digest) ->
                  <<16#04, 16#00, (byte_size(Ticket) + 4):?u24,
                    (erlang:system_time(second)):32/unsigned-big,
                    Ticket/binary>>).
-
--spec generate_fake_response(list()) -> binary().
-generate_fake_response(Extensions) ->
-    BaseSize = rand:uniform(256) + 100,
-    case lists:keyfind(?EXT_ALPN, 1, Extensions) of
-        {_, <<"h2">>} ->
-            crypto:strong_rand_bytes(BaseSize + 50);
-        _ ->
-            crypto:strong_rand_bytes(BaseSize)
-    end.
 
 %% ============================================================================
 %% Internal Helper Functions

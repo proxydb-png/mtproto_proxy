@@ -890,6 +890,16 @@ tls_records_complete(<<_T, _Mj, _Mn, Len:?u16, Rest/binary>>, N) when byte_size(
 tls_records_complete(_B, _N) ->
     false.
 
+
+
+-if(?OTP_RELEASE >= 23).
+hmac(Algo, Key, Str) ->
+    crypto:mac(hmac, Algo, Key, Str).
+-else.
+hmac(Algo, Key, Str) ->
+    crypto:hmac(Algo, Key, Str).
+-endif.
+
 %% ============================================================================
 %% Data stream codec - Enhanced with anti-DPI
 %% ============================================================================
@@ -927,45 +937,26 @@ encode_packet(Bin, St) ->
     {encode_as_frames(Bin), St}.
 
 %% ============================================================================
-%% Anti-DPI: Random fragmentation and padding
+%% Anti-DPI: Random fragmentation only (no padding in data)
 %% ============================================================================
 
 encode_as_frames(Bin) when byte_size(Bin) =< 512 ->
-    %% Small packets: no fragmentation, but maybe add padding
-    as_tls_data_frame_with_padding(Bin);
+    %% Small packets: no fragmentation
+    as_tls_data_frame(Bin);
 encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
     %% Medium packets: 30% chance of fragmentation
     case rand:uniform(10) < 3 of
         true ->
             FragSize = 512 + rand:uniform(byte_size(Bin) - 512),
             <<Frag:FragSize/binary, Rest/binary>> = Bin,
-            [as_tls_data_frame_with_padding(Frag), 
-             as_tls_data_frame_with_padding(Rest)];
+            [as_tls_data_frame(Frag), as_tls_data_frame(Rest)];
         false ->
-            as_tls_data_frame_with_padding(Bin)
+            as_tls_data_frame(Bin)
     end;
 encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
-    %% Large packets: always fragment, with padding
-    [as_tls_data_frame_with_padding(Chunk) | encode_as_frames(Tail)].
+    %% Large packets: always fragment with random boundary variation
+    [as_tls_data_frame(Chunk) | encode_as_frames(Tail)].
 
-%% ============================================================================
-%% Anti-DPI: Add random padding to TLS records (20% chance)
-%% ============================================================================
-
-as_tls_data_frame_with_padding(Bin) ->
-    case rand:uniform(5) =:= 1 of
-        true ->
-            PadSize = rand:uniform(64),
-            Pad = crypto:strong_rand_bytes(PadSize),
-            PaddedData = <<Bin/binary, Pad/binary>>,
-            Size = byte_size(PaddedData),
-            <<?TLS_REC_DATA, ?TLS_12_VERSION, Size:?u16, PaddedData/binary>>;
-        false ->
-            Size = byte_size(Bin),
-            <<?TLS_REC_DATA, ?TLS_12_VERSION, Size:?u16, Bin/binary>>
-    end.
-
-%% Original function kept for handshake
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).
 

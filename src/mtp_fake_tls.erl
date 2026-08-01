@@ -1,23 +1,8 @@
 %%% @author sergey <me@seriyps.ru>
 %%% @copyright (C) 2024, Enhanced Anti-DPI Edition
 %%% @doc
-%%% Fake TLS codec with comprehensive anti-DPI measures:
-%%% - Randomized TLS record versions (1.0, 1.1, 1.2, 1.3)
-%%% - Variable-length padding at all layers
-%%% - Traffic pattern obfuscation with decoy records
-%%% - SNI length normalization
-%%% - Randomized fragmentation boundaries
-%%% - Constant-time cryptographic operations
-%%% - Chaff traffic injection
-%%% - Session ID entropy maximization
-%%% - GREASE with dynamic frequency
-%%% - Certificate compression randomization
-%%% - ECH payload size randomization
-%%% - Timing jitter support
-%%% - Key share size randomization
+%%% Fake TLS codec with comprehensive anti-DPI measures
 %%% @end
-%%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
-%%% Enhanced: 2024 for Anti-DPI resistance
 
 -module(mtp_fake_tls).
 
@@ -97,7 +82,6 @@
 -define(EXT_KEY_SHARE, 51).
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_PADDING, 21).
--define(EXT_GREASE_BASE, 16#0A0A).
 
 -define(DIGEST_POS, 11).
 -define(DIGEST_LEN, 32).
@@ -105,7 +89,7 @@
 -define(APP, mtproto_proxy).
 
 %% ============================================================================
-%% GREASE values (RFC 8701) - Extended for better randomization
+%% GREASE values (RFC 8701)
 %% ============================================================================
 -define(GREASE_VALUES, [
     16#0a0a, 16#1a1a, 16#2a2a, 16#3a3a, 16#4a4a,
@@ -115,7 +99,7 @@
 ]).
 
 %% ============================================================================
-%% Pre-computed constants for performance
+%% Pre-computed constants
 %% ============================================================================
 -define(CACHED_CONSTANTS, #{
     renegotiation_info => <<16#ff, 16#01, 16#00, 16#01, 16#00>>,
@@ -126,35 +110,23 @@
 }).
 
 %% ============================================================================
-%% TLS Fingerprint Profiles - Enhanced with anti-DPI features
+%% TLS Fingerprint Profiles
 %% ============================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
     #{name => chrome_120_enhanced,
       cipher_suites => [
-          16#13, 16#01,   % TLS_AES_128_GCM_SHA256
-          16#13, 16#02,   % TLS_AES_256_GCM_SHA384
-          16#13, 16#03,   % TLS_CHACHA20_POLY1305_SHA256
-          16#c0, 16#2b,   % ECDHE_ECDSA_AES128_GCM_SHA256
-          16#c0, 16#2f,   % ECDHE_RSA_AES128_GCM_SHA256
-          16#c0, 16#2c,   % ECDHE_ECDSA_AES256_GCM_SHA384
-          16#c0, 16#30,   % ECDHE_RSA_AES256_GCM_SHA384
-          16#cc, 16#a9,   % ECDHE_ECDSA_CHACHA20_POLY1305
-          16#cc, 16#a8,   % ECDHE_RSA_CHACHA20_POLY1305
-          16#c0, 16#13,   % ECDHE_RSA_AES128_CBC_SHA
-          16#c0, 16#14,   % ECDHE_RSA_AES256_CBC_SHA
-          16#00, 16#9c,   % RSA_AES128_GCM_SHA256
-          16#00, 16#9d,   % RSA_AES256_GCM_SHA384
-          16#00, 16#2f,   % RSA_AES128_CBC_SHA
-          16#00, 16#35    % RSA_AES256_CBC_SHA
+          16#13, 16#01, 16#13, 16#02, 16#13, 16#03,
+          16#c0, 16#2b, 16#c0, 16#2f, 16#c0, 16#2c,
+          16#c0, 16#30, 16#cc, 16#a9, 16#cc, 16#a8,
+          16#c0, 16#13, 16#c0, 16#14, 16#00, 16#9c,
+          16#00, 16#9d, 16#00, 16#2f, 16#00, 16#35
       ],
       cipher_order_randomized => true,
       grease_count => {3, 6},
       key_share_groups => [
-          16#11, 16#ec,   % X25519MLKEM768
-          16#00, 16#1d,   % x25519
-          16#00, 16#17,   % secp256r1
-          16#00, 16#18    % secp384r1
+          16#11, 16#ec, 16#00, 16#1d,
+          16#00, 16#17, 16#00, 16#18
       ],
       supported_versions => [16#03, 16#04, 16#03, 16#03],
       version_order_randomized => true,
@@ -171,10 +143,8 @@
       ],
       padding_size => {0, 1024},
       record_version_distribution => #{
-        16#0301 => 10,  % TLS 1.0 - 10%
-        16#0302 => 10,  % TLS 1.1 - 10%
-        16#0303 => 50,  % TLS 1.2 - 50%
-        16#0304 => 30   % TLS 1.3 - 30%
+        16#0301 => 10, 16#0302 => 10,
+        16#0303 => 50, 16#0304 => 30
       }
     },
     #{name => firefox_121_enhanced,
@@ -200,8 +170,7 @@
       alpn_protocols => [[<<"h2">>, <<"http/1.1">>]],
       padding_size => {0, 512},
       record_version_distribution => #{
-        16#0303 => 60,
-        16#0304 => 40
+        16#0303 => 60, 16#0304 => 40
       }
     },
     #{name => safari_17_enhanced,
@@ -228,8 +197,7 @@
       alpn_protocols => [[<<"h2">>, <<"http/1.1">>]],
       padding_size => {0, 768},
       record_version_distribution => #{
-        16#0303 => 70,
-        16#0304 => 30
+        16#0303 => 70, 16#0304 => 30
       }
     },
     #{name => edge_120_enhanced,
@@ -257,10 +225,8 @@
       ],
       padding_size => {0, 896},
       record_version_distribution => #{
-        16#0301 => 5,
-        16#0302 => 5,
-        16#0303 => 60,
-        16#0304 => 30
+        16#0301 => 5, 16#0302 => 5,
+        16#0303 => 60, 16#0304 => 30
       }
     }
 ]).
@@ -304,9 +270,9 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         pseudorandom = ClientDigest,
         session_id = SessionId,
         extensions = Extensions
-    } = CliHlo = parse_client_hello(Data),
+    } = parse_client_hello(Data),
     
-    ?LOG_DEBUG("TLS ClientHello parsed successfully", #{}),
+    ?LOG_DEBUG("TLS ClientHello parsed successfully"),
     
     %% Extract SNI domain
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
@@ -343,7 +309,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
     
     %% Generate decoy HTTP data with random size
-    FakeHttpSize = 64 + secure_random:uniform(448),
+    FakeHttpSize = 64 + secure_random_uniform(448),
     FakeHttpData = crypto:strong_rand_bytes(FakeHttpSize),
     
     %% Build response frames with randomized record versions
@@ -404,7 +370,7 @@ derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 
 make_client_hello(Secret, SniDomain) ->
     make_client_hello(
         erlang:system_time(second),
-        crypto:strong_rand_bytes(secure_random:uniform(57) + 8),
+        crypto:strong_rand_bytes(secure_random_uniform(57) + 8),
         Secret,
         SniDomain
     ).
@@ -449,9 +415,9 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile) ->
     EcPointExt = build_ec_point_formats(Profile),
     
     %% Add random session ticket extension
-    SessionTicketExt = case secure_random:uniform(3) of
-        1 -> <<16#00, 16#23, (secure_random:uniform(256) + 32):?u16,
-               (crypto:strong_rand_bytes(secure_random:uniform(256) + 32))/binary>>;
+    SessionTicketExt = case secure_random_uniform(3) of
+        1 -> <<16#00, 16#23, (secure_random_uniform(256) + 32):?u16,
+               (crypto:strong_rand_bytes(secure_random_uniform(256) + 32))/binary>>;
         _ -> maps:get(session_ticket_short, ?CACHED_CONSTANTS)
     end,
     
@@ -491,14 +457,15 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile) ->
         _ -> {1100, 1600}
     end,
     
-    PadSize = max(0, (MinTarget + secure_random:uniform(MaxTarget - MinTarget)) - BaseSize),
+    TargetSize = MinTarget + secure_random_uniform(MaxTarget - MinTarget),
+    PadSize = max(0, TargetSize - BaseSize),
     
     %% Build padding extension
-    PaddingExt = case PadSize of
-        0 -> <<>>;
-        N when N > 4 ->
-            PadData = crypto:strong_rand_bytes(N - 4),
-            <<?EXT_PADDING:?u16, N:?u16, PadData/binary>>
+    PaddingExt = if
+        PadSize =:= 0 -> <<>>;
+        PadSize > 4 ->
+            PadData = crypto:strong_rand_bytes(PadSize - 4),
+            <<?EXT_PADDING:?u16, PadSize:?u16, PadData/binary>>
     end,
     
     FinalExtensions = case PaddingExt of
@@ -515,13 +482,13 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile) ->
 -spec parse_server_hello(binary()) -> 
     {binary(), binary(), binary(), binary()} | incomplete | 
     {error, tls_domain_forwarding | tls_alert | not_proxy_response}.
-parse_server_hello(<<?TLS_REC_HANDSHAKE, Ver:?u16, HSLen:?u16, 
+parse_server_hello(<<?TLS_REC_HANDSHAKE, _Ver:?u16, HSLen:?u16, 
                      Handshake:HSLen/binary, Tail0/binary>>) ->
     case Tail0 of
-        <<?TLS_REC_CHANGE_CIPHER, Ver2:?u16, CCLen:?u16, 
+        <<?TLS_REC_CHANGE_CIPHER, _Ver2:?u16, CCLen:?u16, 
           ChangeCipher:CCLen/binary, Tail1/binary>> ->
             case Tail1 of
-                <<?TLS_REC_DATA, Ver3:?u16, DLen:?u16, 
+                <<?TLS_REC_DATA, _Ver3:?u16, DLen:?u16, 
                   Data:DLen/binary, Tail/binary>> ->
                     {Handshake, ChangeCipher, Data, Tail};
                 _ when byte_size(Tail1) < 5 ->
@@ -554,7 +521,7 @@ parse_server_hello(_) ->
 new() ->
     #st{
         decoy_counter = 0,
-        fragmentation_seed = secure_random:uniform(1 bsl 32),
+        fragmentation_seed = secure_random_uniform(1 bsl 32),
         record_version_sequence = generate_version_sequence(),
         padding_profile = generate_padding_profile()
     }.
@@ -569,11 +536,9 @@ try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, _Ver:?u16, Size:?u16,
     try_decode_packet(Tail, St);
 try_decode_packet(<<?TLS_REC_ALERT, _Ver:?u16, Size:?u16,
                     _Alert:Size/binary, Tail/binary>>, St) ->
-    %% Ignore alert records (possibly decoys)
     try_decode_packet(Tail, St);
 try_decode_packet(<<?TLS_REC_HANDSHAKE, _Ver:?u16, Size:?u16,
                     _Handshake:Size/binary, Tail/binary>>, St) ->
-    %% Ignore handshake records (possibly decoys)
     try_decode_packet(Tail, St);
 try_decode_packet(Bin, St) when byte_size(Bin) =< (?MAX_IN_PACKET_SIZE + 5) ->
     {incomplete, St};
@@ -611,7 +576,7 @@ encode_with_anti_dpi(Bin, St0, Options) ->
     %% Encode fragments as TLS records
     EncodedFrames = lists:map(
         fun(Fragment) ->
-            encode_single_frame(Fragment, St1)
+            element(1, encode_single_frame(Fragment, St1))
         end, Fragments),
     
     %% Inject decoy records if enabled
@@ -633,19 +598,17 @@ encode_single_frame(Bin, St) ->
 random_fragment(Bin, St) when byte_size(Bin) =< ?MIN_OUT_PACKET_SIZE ->
     {[Bin], St};
 random_fragment(Bin, St) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
-    %% Random decision: fragment or not
-    case secure_random:uniform(10) < 7 of
+    case secure_random_uniform(10) < 7 of
         true -> {[Bin], St};
         false ->
             FragSize = ?MIN_OUT_PACKET_SIZE + 
-                       secure_random:uniform(byte_size(Bin) - ?MIN_OUT_PACKET_SIZE),
+                       secure_random_uniform(byte_size(Bin) - ?MIN_OUT_PACKET_SIZE),
             <<Frag:FragSize/binary, Rest/binary>> = Bin,
             {[Frag, Rest], St}
     end;
 random_fragment(Bin, St) ->
-    %% Always fragment large data, but with random boundaries
     ChunkSize = ?MIN_OUT_PACKET_SIZE + 
-                secure_random:uniform(?MAX_OUT_PACKET_SIZE - ?MIN_OUT_PACKET_SIZE),
+                secure_random_uniform(?MAX_OUT_PACKET_SIZE - ?MIN_OUT_PACKET_SIZE),
     <<Chunk:ChunkSize/binary, Rest/binary>> = Bin,
     {Frags, St1} = random_fragment(Rest, St),
     {[Chunk | Frags], St1}.
@@ -654,7 +617,7 @@ inject_decoy_records(Frames, #st{decoy_counter = Counter} = St) ->
     case Counter rem 5 of
         0 ->
             Decoy = generate_decoy_record(),
-            Pos = secure_random:uniform(length(Frames) + 1),
+            Pos = secure_random_uniform(length(Frames) + 1),
             NewFrames = insert_at(Frames, Pos, [Decoy]),
             {NewFrames, St#st{decoy_counter = Counter + 1}};
         _ ->
@@ -662,7 +625,7 @@ inject_decoy_records(Frames, #st{decoy_counter = Counter} = St) ->
     end.
 
 generate_decoy_record() ->
-    Type = case secure_random:uniform(4) of
+    Type = case secure_random_uniform(4) of
         1 -> ?TLS_REC_CHANGE_CIPHER;
         2 -> ?TLS_REC_ALERT;
         _ -> ?TLS_REC_HANDSHAKE
@@ -670,17 +633,17 @@ generate_decoy_record() ->
     
     Payload = case Type of
         ?TLS_REC_CHANGE_CIPHER -> 
-            <<1, (crypto:strong_rand_bytes(secure_random:uniform(32)))/binary>>;
+            <<1, (crypto:strong_rand_bytes(secure_random_uniform(32)))/binary>>;
         ?TLS_REC_ALERT ->
-            AlertType = case secure_random:uniform(2) of
+            AlertType = case secure_random_uniform(2) of
                 1 -> <<?TLS_ALERT_LEVEL_WARNING, ?TLS_ALERT_CLOSE_NOTIFY>>;
                 2 -> <<?TLS_ALERT_FATAL, ?TLS_ALERT_DECODE_ERROR>>
             end,
-            PadSize = secure_random:uniform(32),
+            PadSize = secure_random_uniform(32),
             <<AlertType/binary, (crypto:strong_rand_bytes(PadSize))/binary>>;
         ?TLS_REC_HANDSHAKE ->
-            HandshakeType = secure_random:uniform(254) + 1,
-            HandshakeLen = secure_random:uniform(128) + 4,
+            HandshakeType = secure_random_uniform(254) + 1,
+            HandshakeLen = secure_random_uniform(128) + 4,
             <<HandshakeType, HandshakeLen:?u24, 
               (crypto:strong_rand_bytes(HandshakeLen))/binary>>
     end,
@@ -699,10 +662,6 @@ as_tls_frame_with_version(Type, Version, Data) ->
     Size = iolist_size(Data),
     <<Type, Version:?u16, Size:?u16, Data/binary>>.
 
-as_tls_frame(Type, Data) ->
-    Size = iolist_size(Data),
-    <<Type, ?TLS_12_VERSION, Size:?u16, Data/binary>>.
-
 random_record_version() ->
     Versions = [16#0301, 16#0302, 16#0303, 16#0304],
     Weights = [10, 10, 50, 30],
@@ -710,22 +669,22 @@ random_record_version() ->
 
 weighted_random(Items, Weights) ->
     Total = lists:sum(Weights),
-    Random = secure_random:uniform(Total),
+    Random = secure_random_uniform(Total),
     weighted_random_select(Items, Weights, Random).
 
 weighted_random_select([Item | _], [Weight | _], Random) when Random =< Weight ->
     Item;
-weighted_random_select([_ | Items], [Weight | Weights], Random) ->
-    weighted_random_select(Items, Weights, Random - Weight).
+weighted_random_select([_ | Items], [_ | Weights], Random) ->
+    weighted_random_select(Items, Weights, Random).
 
 generate_version_sequence() ->
     [random_record_version() || _ <- lists:seq(1, 20)].
 
 generate_padding_profile() ->
     #{
-        min_pad => secure_random:uniform(16),
-        max_pad => secure_random:uniform(64) + 32,
-        pad_frequency => secure_random:uniform(5)
+        min_pad => secure_random_uniform(16),
+        max_pad => secure_random_uniform(64) + 32,
+        pad_frequency => secure_random_uniform(5)
     }.
 
 %% ============================================================================
@@ -740,7 +699,7 @@ build_hello_base(SessionId, CipherSuites, ExtBin) ->
     TlsLen = HelloBodyLen + 4,
     <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
       ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
-      0:?DIGEST_LEN/binary,  %% Placeholder for random
+      0:?DIGEST_LEN/binary,
       SessIdLen, SessionId/binary,
       CSLen:?u16, CipherSuites/binary,
       1, 0,
@@ -772,28 +731,28 @@ build_final_hello(SessionId, CipherSuites, ExtBin, Secret, Timestamp) ->
 %% ============================================================================
 
 build_cipher_suites(#{cipher_suites := Suites, grease_count := {Min, Max}}) ->
-    GreaseCount = Min + secure_random:uniform(Max - Min + 1),
-    GreaseVals = [lists:nth(secure_random:uniform(length(?GREASE_VALUES)), 
+    GreaseCount = Min + secure_random_uniform(Max - Min + 1),
+    GreaseVals = [lists:nth(secure_random_uniform(length(?GREASE_VALUES)), 
                             ?GREASE_VALUES) || _ <- lists:seq(1, GreaseCount)],
     
     WithGrease = lists:foldl(
         fun(G, Acc) ->
-            Pos = secure_random:uniform(length(Acc) + 1),
+            Pos = secure_random_uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, Suites, GreaseVals),
     
     << <<S:?u16>> || S <- WithGrease >>.
 
 build_key_share_entries(#{key_share_groups := Groups, grease_count := {Min, Max}}) ->
-    GreaseCount = Min + secure_random:uniform(Max - Min + 1),
-    GreaseVals = [lists:nth(secure_random:uniform(length(?GREASE_VALUES)),
+    GreaseCount = Min + secure_random_uniform(Max - Min + 1),
+    GreaseVals = [lists:nth(secure_random_uniform(length(?GREASE_VALUES)),
                             ?GREASE_VALUES) || _ <- lists:seq(1, GreaseCount)],
     
     GreaseEntries = [<<G:?u16, 0:16, (crypto:strong_rand_bytes(1))/binary>> || G <- GreaseVals],
     
     RealEntries = [
         begin
-            KeySize = key_size_for_group(Group) + secure_random:uniform(33) - 17,
+            KeySize = key_size_for_group(Group) + secure_random_uniform(33) - 17,
             ActualKeySize = max(1, KeySize),
             Key = crypto:strong_rand_bytes(ActualKeySize),
             <<Group:?u16, ActualKeySize:?u16, Key/binary>>
@@ -803,7 +762,7 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {Min, Max}
     
     AllEntries = lists:foldl(
         fun(G, Acc) ->
-            Pos = secure_random:uniform(length(Acc) + 1),
+            Pos = secure_random_uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, RealEntries, GreaseEntries),
     
@@ -811,13 +770,13 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {Min, Max}
 
 build_supported_versions_ext(#{supported_versions := Versions, 
                                grease_count := {Min, Max}}) ->
-    GreaseCount = Min + secure_random:uniform(Max - Min + 1),
-    GreaseVals = [lists:nth(secure_random:uniform(length(?GREASE_VALUES)),
+    GreaseCount = Min + secure_random_uniform(Max - Min + 1),
+    GreaseVals = [lists:nth(secure_random_uniform(length(?GREASE_VALUES)),
                             ?GREASE_VALUES) || _ <- lists:seq(1, GreaseCount)],
     
     WithGrease = lists:foldl(
         fun(G, Acc) ->
-            Pos = secure_random:uniform(length(Acc) + 1),
+            Pos = secure_random_uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, Versions, GreaseVals),
     
@@ -837,8 +796,8 @@ build_sig_algos(#{sig_algorithms_count := Count}) ->
       << <<A:8>> || A <- Selected >>/binary>>.
 
 build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
-    PayloadSize = lists:nth(secure_random:uniform(length(Sizes)), Sizes),
-    EchRand1 = crypto:strong_rand_bytes(secure_random:uniform(4) + 1),
+    PayloadSize = lists:nth(secure_random_uniform(length(Sizes)), Sizes),
+    EchRand1 = crypto:strong_rand_bytes(secure_random_uniform(4) + 1),
     EchRand32 = crypto:strong_rand_bytes(32),
     EchPayload = crypto:strong_rand_bytes(PayloadSize),
     EchContent = <<
@@ -853,7 +812,7 @@ build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
 build_ech(_) -> <<>>.
 
 build_alpn(#{alpn_protocols := Protocols}) ->
-    Selected = lists:nth(secure_random:uniform(length(Protocols)), Protocols),
+    Selected = lists:nth(secure_random_uniform(length(Protocols)), Protocols),
     ProtocolEntries = << <<(byte_size(P)):8, P/binary>> || P <- Selected >>,
     ProtocolsLen = byte_size(ProtocolEntries),
     <<16#00, 16#10, (ProtocolsLen + 2):?u16, ProtocolsLen:?u16, 
@@ -861,7 +820,7 @@ build_alpn(#{alpn_protocols := Protocols}) ->
 build_alpn(_) -> <<>>.
 
 build_compress_certificate(#{compress_certificate := brotli}) ->
-    Algos = case secure_random:uniform(2) of
+    Algos = case secure_random_uniform(2) of
         1 -> <<16#00, 16#02>>;
         2 -> <<16#00, 16#02, 16#00, 16#01>>
     end,
@@ -870,7 +829,7 @@ build_compress_certificate(#{compress_certificate := brotli}) ->
 build_compress_certificate(_) -> <<>>.
 
 build_ec_point_formats(#{ec_point_formats := true}) ->
-    Formats = case secure_random:uniform(3) of
+    Formats = case secure_random_uniform(3) of
         1 -> <<16#01, 16#00>>;
         2 -> <<16#01, 16#00, 16#01, 16#02>>;
         3 -> <<16#02, 16#00, 16#01>>
@@ -880,20 +839,18 @@ build_ec_point_formats(#{ec_point_formats := true}) ->
 build_ec_point_formats(_) -> <<>>.
 
 build_supported_groups(#{key_share_groups := Groups, grease_count := {Min, Max}}) ->
-    GreaseCount = Min + secure_random:uniform(Max - Min + 1),
-    GreaseVals = [lists:nth(secure_random:uniform(length(?GREASE_VALUES)),
+    GreaseCount = Min + secure_random_uniform(Max - Min + 1),
+    GreaseVals = [lists:nth(secure_random_uniform(length(?GREASE_VALUES)),
                             ?GREASE_VALUES) || _ <- lists:seq(1, GreaseCount)],
     
     AdditionalGroups = [
-        16#00, 16#1e,  % x448
-        16#01, 16#00,  % ffdhe2048
-        16#01, 16#01,  % ffdhe3072
-        16#01, 16#02   % ffdhe4096
+        16#00, 16#1e, 16#01, 16#00,
+        16#01, 16#01, 16#01, 16#02
     ],
     
     AllGroups = lists:foldl(
         fun(G, Acc) ->
-            Pos = secure_random:uniform(length(Acc) + 1),
+            Pos = secure_random_uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, Groups ++ AdditionalGroups, GreaseVals),
     
@@ -902,9 +859,9 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {Min, Max}}
     <<16#00, 16#0a, (GroupsLen + 2):?u16, GroupsLen:?u16, GroupsBin/binary>>.
 
 build_app_layer_settings() ->
-    case secure_random:uniform(3) of
+    case secure_random_uniform(3) of
         1 ->
-            Proto = case secure_random:uniform(2) of
+            Proto = case secure_random_uniform(2) of
                 1 -> <<$h, $2>>;
                 2 -> <<$h, $3>>
             end,
@@ -1022,17 +979,17 @@ key_size_for_group(16#001E) -> 56;
 key_size_for_group(16#0100) -> 256;
 key_size_for_group(16#0101) -> 384;
 key_size_for_group(16#0102) -> 512;
-key_size_for_group(_) -> 32 + secure_random:uniform(64).
+key_size_for_group(_) -> 32 + secure_random_uniform(64).
 
 random_tls_profile() ->
     Profiles = ?TLS_FINGERPRINT_PROFILES,
-    Profile = lists:nth(secure_random:uniform(length(Profiles)), Profiles),
+    Profile = lists:nth(secure_random_uniform(length(Profiles)), Profiles),
     ?LOG_DEBUG("Selected TLS fingerprint: ~s", [maps:get(name, Profile, unknown)]),
     Profile.
 
 shuffle_list([]) -> [];
 shuffle_list(List) ->
-    Sorted = [{secure_random:uniform(), X} || X <- List],
+    Sorted = [{secure_random_uniform(1 bsl 32), X} || X <- List],
     [X || {_, X} <- lists:sort(Sorted)].
 
 insert_at(List, Pos, Items) when Pos =< 1 ->
@@ -1080,7 +1037,8 @@ decode_all(Bin, Acc, St0) ->
 %% Secure Random Number Generation
 %% ============================================================================
 
-secure_random:uniform(Max) when is_integer(Max), Max > 0 ->
+-spec secure_random_uniform(pos_integer()) -> pos_integer().
+secure_random_uniform(Max) when is_integer(Max), Max > 0 ->
     <<N:?u32>> = crypto:strong_rand_bytes(4),
     (N rem Max) + 1.
 

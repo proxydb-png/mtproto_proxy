@@ -1,7 +1,12 @@
 %%% @author sergey <me@seriyps.ru>
 %%% @copyright (C) 2024, Enhanced Anti-DPI Edition
 %%% @doc
-%%% Fake TLS codec with anti-DPI enhancements
+%%% Fake TLS codec with anti-DPI enhancements:
+%%% - Multiple browser fingerprint profiles
+%%% - GREASE values for cipher suites and key shares
+%%% - Random fragmentation
+%%% - Variable padding
+%%% - Randomized fake HTTP data sizes
 %%% @end
 
 -module(mtp_fake_tls).
@@ -84,7 +89,7 @@
 ]).
 
 %% ============================================================================
-%% TLS Fingerprint Profiles
+%% TLS Fingerprint Profiles - Extended
 %% ============================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
@@ -114,6 +119,35 @@
       ],
       grease_count => {2, 3},
       key_share_groups => [16#00, 16#1d, 16#00, 16#17],
+      session_id_length => 32
+    },
+    #{name => safari_17,
+      cipher_suites => [
+          16#13, 16#01, 16#13, 16#02, 16#13, 16#03,
+          16#c0, 16#2b, 16#c0, 16#2f, 16#c0, 16#2c,
+          16#c0, 16#30, 16#cc, 16#a9, 16#cc, 16#a8,
+          16#c0, 16#13, 16#c0, 16#14
+      ],
+      grease_count => {2, 4},
+      key_share_groups => [
+          16#00, 16#1d, 16#00, 16#17,
+          16#00, 16#18, 16#00, 16#19
+      ],
+      session_id_length => 32
+    },
+    #{name => edge_120,
+      cipher_suites => [
+          16#13, 16#01, 16#13, 16#02, 16#13, 16#03,
+          16#c0, 16#2b, 16#c0, 16#2f, 16#c0, 16#2c,
+          16#c0, 16#30, 16#cc, 16#a9, 16#cc, 16#a8,
+          16#c0, 16#13, 16#c0, 16#14, 16#00, 16#9c,
+          16#00, 16#9d, 16#00, 16#2f, 16#00, 16#35
+      ],
+      grease_count => {2, 4},
+      key_share_groups => [
+          16#11, 16#ec, 16#00, 16#1d,
+          16#00, 16#17
+      ],
       session_id_length => 32
     }
 ]).
@@ -219,7 +253,11 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
     
     %% Generate random HTTP data with variable size for anti-DPI
-    FakeHttpSize = 64 + rand:uniform(448),
+    FakeHttpSize = case rand:uniform(3) of
+        1 -> 64 + rand:uniform(192);     %% Small: 64-256 bytes
+        2 -> 256 + rand:uniform(256);    %% Medium: 256-512 bytes
+        3 -> 512 + rand:uniform(512)     %% Large: 512-1024 bytes
+    end,
     FakeHttpData = crypto:strong_rand_bytes(FakeHttpSize),
     
     Response0 = [_, CC, DD] =
@@ -528,7 +566,7 @@ tls_records_complete(_B, _N) ->
     false.
 
 %% ============================================================================
-%% Data stream codec
+%% Data stream codec - Enhanced with anti-DPI features
 %% ============================================================================
 
 -spec new() -> codec().
@@ -563,11 +601,47 @@ decode_all(Bin, Acc, St0) ->
 encode_packet(Bin, St) ->
     {encode_as_frames(Bin), St}.
 
-encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
-    as_tls_data_frame(Bin);
-encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
-    [as_tls_data_frame(Chunk) | encode_as_frames(Tail)].
+%% ============================================================================
+%% Enhanced frame encoding with anti-DPI measures
+%% ============================================================================
 
+encode_as_frames(Bin) when byte_size(Bin) =< 512 ->
+    %% Small packets: no fragmentation, random padding
+    as_tls_data_frame_with_padding(Bin);
+encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
+    %% Medium packets: 30% chance of fragmentation
+    case rand:uniform(10) < 3 of
+        true ->
+            FragSize = 512 + rand:uniform(byte_size(Bin) - 512),
+            <<Frag:FragSize/binary, Rest/binary>> = Bin,
+            [as_tls_data_frame_with_padding(Frag), 
+             as_tls_data_frame_with_padding(Rest)];
+        false ->
+            as_tls_data_frame_with_padding(Bin)
+    end;
+encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
+    %% Large packets: always fragment, add padding to some
+    [as_tls_data_frame_with_padding(Chunk) | encode_as_frames(Tail)].
+
+%% ============================================================================
+%% TLS frame with optional random padding
+%% ============================================================================
+
+as_tls_data_frame_with_padding(Bin) ->
+    %% 20% chance of adding random padding
+    case rand:uniform(5) =:= 1 of
+        true ->
+            PadSize = rand:uniform(64),
+            Pad = crypto:strong_rand_bytes(PadSize),
+            PaddedData = <<Bin/binary, Pad/binary>>,
+            Size = byte_size(PaddedData),
+            <<?TLS_REC_DATA, ?TLS_12_VERSION, Size:?u16, PaddedData/binary>>;
+        false ->
+            Size = byte_size(Bin),
+            <<?TLS_REC_DATA, ?TLS_12_VERSION, Size:?u16, Bin/binary>>
+    end.
+
+%% Keep original function for backward compatibility
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).
 

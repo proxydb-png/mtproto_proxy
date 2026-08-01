@@ -890,16 +890,6 @@ tls_records_complete(<<_T, _Mj, _Mn, Len:?u16, Rest/binary>>, N) when byte_size(
 tls_records_complete(_B, _N) ->
     false.
 
-
-
--if(?OTP_RELEASE >= 23).
-hmac(Algo, Key, Str) ->
-    crypto:mac(hmac, Algo, Key, Str).
--else.
-hmac(Algo, Key, Str) ->
-    crypto:hmac(Algo, Key, Str).
--endif.
-
 %% ============================================================================
 %% Data stream codec - Enhanced with anti-DPI
 %% ============================================================================

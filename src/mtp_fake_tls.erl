@@ -5,7 +5,7 @@
 %%% https://github.com/telegramdesktop/tdesktop/commit/69b6b487382c12efc43d52f472cab5954ab850e2
 %%% It's not real TLS, but it looks like TLS1.3 from outside
 %%% Enhanced with deep fingerprint randomization for maximum evasion
-%%% Added Session Ticket and OCSP stapling support (hybrid version)
+%%% Added Session Ticket and OCSP stapling support
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -344,13 +344,18 @@ match_domain(Domain, Allowed) ->
 %% ============================================================================
 -spec generate_ocsp_response(binary()) -> binary().
 generate_ocsp_response(_ServerDigest) ->
+    %% Generate a realistic-looking OCSP response
+    %% OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
     OcspStatus = 0,
-    ResponderId = crypto:strong_rand_bytes(20),
+    %% Basic OCSP Response structure
+    ResponderId = crypto:strong_rand_bytes(20),  % SHA1 hash
     ProducedAt = erlang:system_time(seconds),
+    %% This update + 7 days
     ThisUpdate = ProducedAt,
     NextUpdate = ProducedAt + 604800,
-    CertId = crypto:strong_rand_bytes(36),
-    CertStatus = <<0>>,
+    %% Single response for our certificate
+    CertId = crypto:strong_rand_bytes(36),  % HashAlgorithm + IssuerNameHash + IssuerKeyHash + SerialNumber
+    CertStatus = <<0>>,  % good
     SingleResponse = <<CertId/binary, CertStatus/binary, 
                         (encode_generalized_time(ThisUpdate))/binary,
                         (encode_generalized_time(NextUpdate))/binary>>,
@@ -383,16 +388,16 @@ generate_session_ticket(_Secret) ->
     TicketAgeAdd = crypto:strong_rand_bytes(4),
     TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
     Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
-    TicketLifetime = 604800,
+    TicketLifetime = 604800,  % 7 days
     
     <<TicketLifetime:32, TicketAgeAdd/binary, 
       (byte_size(TicketNonce)):8, TicketNonce/binary,
       (byte_size(Ticket)):?u16, Ticket/binary,
-      0:?u16>>.
+      0:?u16>>.  % No extensions
 
 %% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Hybrid version: Session Ticket + OCSP with correct hash calculation
+%% Enhanced with Session Ticket and OCSP support
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -444,22 +449,12 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                                HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
-    %% Build base response WITHOUT session ticket for digest calculation
-    ResponseBase = [_, CC, DD] =
-        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
-    
-    %% Calculate digest with base response (without ticket - matches original ClientHello)
-    SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | ResponseBase]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
-                              HasSessionTicket, HasOcspStapling),
-    
-    %% Generate Session Ticket if client supports it (AFTER digest calculation)
+    %% Generate Session Ticket if client supports it
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
             Ticket = generate_session_ticket(Secret),
-            {Ticket, as_tls_frame(?TLS_REC_HANDSHAKE, Ticket)};
+            TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
+            {Ticket, TicketRecord2};
         false ->
             {undefined, <<>>}
     end,
@@ -472,11 +467,21 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             undefined
     end,
     
-    %% Build final response with proper digest + optional ticket
+    %% Build initial response without proper digest
+    Response0 = [_, CC, DD, ST] =
+        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
+         as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+         TicketRecord],
+    
+    %% Calculate digest with complete response
+    SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
+                              HasSessionTicket, HasOcspStapling),
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
                 DD,
-                TicketRecord],
+                ST],
     
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
@@ -687,12 +692,14 @@ build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, Greas
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
+    %% Interleave GREASE values at random positions
     WithGrease = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, Suites, GreaseVals),
     
+    %% Randomize order if profile says so
     Final = case maps:get(cipher_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
@@ -709,8 +716,10 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
+    %% GREASE entries (group + 1-byte key)
     GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
     
+    %% Real key share entries
     RealEntries = [
         begin
             KeySize = key_size_for_group(Group),
@@ -720,6 +729,7 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
         || Group <- Groups
     ],
     
+    %% Interleave GREASE randomly
     AllEntries = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
@@ -770,17 +780,17 @@ build_supported_versions_ext(#{supported_versions := Versions,
 -spec build_sig_algos(map()) -> binary().
 build_sig_algos(#{sig_algorithms_count := Count}) ->
     AllAlgos = [
-        16#04, 16#03,
-        16#05, 16#03,
-        16#06, 16#03,
-        16#02, 16#03,
-        16#08, 16#04,
-        16#08, 16#05,
-        16#08, 16#06,
-        16#04, 16#01,
-        16#05, 16#01,
-        16#06, 16#01,
-        16#02, 16#01,
+        16#04, 16#03,   % ecdsa_secp256r1_sha256
+        16#05, 16#03,   % ecdsa_secp384r1_sha384
+        16#06, 16#03,   % ecdsa_secp521r1_sha512
+        16#02, 16#03,   % ecdsa_sha1
+        16#08, 16#04,   % rsa_pss_rsae_sha256
+        16#08, 16#05,   % rsa_pss_rsae_sha384
+        16#08, 16#06,   % rsa_pss_rsae_sha512
+        16#04, 16#01,   % rsa_pkcs1_sha256
+        16#05, 16#01,   % rsa_pkcs1_sha384
+        16#06, 16#01,   % rsa_pkcs1_sha512
+        16#02, 16#01,   % rsa_pkcs1_sha1
         16#04, 16#02,
         16#03, 16#02,
         16#02, 16#02,
@@ -790,9 +800,9 @@ build_sig_algos(#{sig_algorithms_count := Count}) ->
     Shuffled = shuffle_list(Selected),
     AlgoListLen = Count * 2,
     ExtLen = AlgoListLen + 2,
-    <<16#00, 16#0d,
-      ExtLen:?u16,
-      AlgoListLen:?u16,
+    <<16#00, 16#0d,             % signature_algorithms
+      ExtLen:?u16,               % ext length
+      AlgoListLen:?u16,          % list length
       << <<A:8>> || A <- Shuffled >>/binary>>.
 
 %% ============================================================================
@@ -827,9 +837,9 @@ build_alpn(#{alpn_protocols := Protocols}) ->
     Selected = lists:nth(rand:uniform(length(Protocols)), Protocols),
     ProtocolEntries = << <<(byte_size(P)):8, P/binary>> || P <- Selected >>,
     ProtocolsLen = byte_size(ProtocolEntries),
-    <<16#00, 16#10,
-      (ProtocolsLen + 2):?u16,
-      ProtocolsLen:?u16,
+    <<16#00, 16#10,              % application_layer_protocol_negotiation
+      (ProtocolsLen + 2):?u16,    % ext length
+      ProtocolsLen:?u16,          % list length
       ProtocolEntries/binary>>;
 build_alpn(_) ->
     <<>>.
@@ -863,6 +873,7 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
+    %% Interleave GREASE
     WithGrease = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
@@ -871,9 +882,9 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
     
     GroupsBin = << <<G:?u16>> || G <- WithGrease >>,
     GroupsLen = byte_size(GroupsBin),
-    <<16#00, 16#0a,
-      (GroupsLen + 2):?u16,
-      GroupsLen:?u16,
+    <<16#00, 16#0a,              % supported_groups
+      (GroupsLen + 2):?u16,       % ext length
+      GroupsLen:?u16,             % list length
       GroupsBin/binary>>.
 
 %% ============================================================================
@@ -898,6 +909,7 @@ build_padding(_) ->
 %% ============================================================================
 -spec build_session_ticket_ext(map()) -> binary().
 build_session_ticket_ext(#{session_ticket_enabled := true}) ->
+    %% Empty session ticket extension - client indicates support
     <<?EXT_SESSION_TICKET:?u16, 0:?u16>>;
 build_session_ticket_ext(_) ->
     <<>>.
@@ -908,6 +920,7 @@ build_session_ticket_ext(_) ->
 %% ============================================================================
 -spec build_ocsp_stapling_ext(map()) -> binary().
 build_ocsp_stapling_ext(#{ocsp_stapling_enabled := true}) ->
+    %% status_request extension with OCSP type
     <<?EXT_STATUS_REQUEST:?u16, 0:?u16>>;
 build_ocsp_stapling_ext(_) ->
     <<>>.
@@ -936,57 +949,84 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain) when byte_size(Hex
     make_client_hello(Timestamp, SessionId, mtp_handler:unhex(HexSecret), SniDomain);
 make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(SessionId) == 32,
                                                                 byte_size(Secret) == 16 ->
+    %% ============================================================
+    %% Random TLS Fingerprint Profile Selection
+    %% ============================================================
     Profile = random_tls_profile(),
 
+    %% Cipher suites with GREASE and optional randomization
     CipherSuites = build_cipher_suites(Profile),
+
+    %% SNI
     SNI = make_sni([SniDomain]),
+
+    %% Signature algorithms
     SigAlgos = build_sig_algos(Profile),
+
+    %% Supported groups with GREASE
     SupportedGroups = build_supported_groups(Profile),
-    
+
+    %% Supported versions with GREASE
     SupportedVersionsExt = build_supported_versions_ext(Profile),
     VersionsLen = byte_size(SupportedVersionsExt),
     SupportedVersions =
-        <<16#00, 16#2b,
-          (VersionsLen + 1):?u16,
-          VersionsLen,
+        <<16#00, 16#2b,              % supported_versions
+          (VersionsLen + 1):?u16,     % ext length
+          VersionsLen,                % list length
           SupportedVersionsExt/binary>>,
 
+    %% Key share with GREASE
     KeyShareEntries = build_key_share_entries(Profile),
     KSListLen = byte_size(KeyShareEntries),
     KeyShare =
-        <<16#00, 16#33,
-          (KSListLen + 2):?u16,
+        <<16#00, 16#33,              % key_share
+          (KSListLen + 2):?u16,       % ext length
           KSListLen:?u16,
           KeyShareEntries/binary>>,
 
+    %% ECH
     ECH = build_ech(Profile),
+
+    %% ALPN
     ALPN = build_alpn(Profile),
+
+    %% Compress certificate
     CompCertExt = build_compress_certificate(Profile),
+
+    %% EC point formats
     EcPointExt = build_ec_point_formats(Profile),
+
+    %% Session Ticket extension
     SessionTicketExt = build_session_ticket_ext(Profile),
+
+    %% OCSP Stapling extension
     OcspStaplingExt = build_ocsp_stapling_ext(Profile),
+
+    %% Random padding
     PaddingExt = build_padding(Profile),
 
+    %% Build extensions list
     ExtensionsBase = [
         ECH,
-        SessionTicketExt,
-        EcPointExt,
+        SessionTicketExt,                            % Session Ticket
+        EcPointExt,                                   % EC point formats
         <<16#44, 16#cd, 16#00, 16#05,
-          16#00, 16#03, 16#02, $h, $2>>,
+          16#00, 16#03, 16#02, $h, $2>>,             % application_layer_protocol_settings
         KeyShare,
-        <<16#00, 16#12, 0:16>>,
+        <<16#00, 16#12, 0:16>>,                      % signed_certificate_timestamp
         SupportedGroups,
         CompCertExt,
-        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,
+        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,       % renegotiation_info
         SigAlgos,
-        OcspStaplingExt,
-        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>,
+        OcspStaplingExt,                              % OCSP Stapling
+        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>, % psk_key_exchange_modes
         ALPN,
         SNI,
         SupportedVersions,
         PaddingExt
     ],
 
+    %% Filter empty and optionally randomize order
     NonEmpty = [E || E <- ExtensionsBase, E =/= <<>>],
     Extensions = case maps:get(extensions_order_randomized, Profile, false) of
         true -> shuffle_list(NonEmpty);
@@ -1031,6 +1071,7 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
                      ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
                      Tail/binary>>) ->
+    %% ServerHello with Session Ticket
     {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;

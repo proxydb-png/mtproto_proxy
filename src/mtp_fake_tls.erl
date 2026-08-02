@@ -6,6 +6,7 @@
 %%% It's not real TLS, but it looks like TLS1.3 from outside
 %%% Enhanced with deep fingerprint randomization for maximum evasion
 %%% Added Session Ticket and OCSP stapling support
+%%% Fixed Telegram X response hash mismatch compatibilities
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -98,6 +99,7 @@
 %% ============================================================================
 %% TLS Fingerprint Profiles - randomized per connection
 %% Each profile mimics a different real browser/TLS implementation
+%% Optimized padding to ensure compatibility with Telegram X parser limits.
 %% ============================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
@@ -143,9 +145,11 @@
           [<<"h2">>],
           [<<"http/1.1">>]
       ],
-      padding_size => {0, 512},
+      padding_size => {0, 128},
       session_ticket_enabled => true,
-      ocsp_stapling_enabled => true
+      ocsp_stapling_enabled => true,
+      alps_enabled => true,
+      renegotiation_info_enabled => true
     },
     #{name => firefox_121,
       cipher_suites => [
@@ -187,9 +191,11 @@
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 256},
+      padding_size => {0, 128},
       session_ticket_enabled => true,
-      ocsp_stapling_enabled => false
+      ocsp_stapling_enabled => true,
+      alps_enabled => false,
+      renegotiation_info_enabled => true
     },
     #{name => safari_17,
       cipher_suites => [
@@ -226,9 +232,11 @@
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 512},
-      session_ticket_enabled => false,
-      ocsp_stapling_enabled => true
+      padding_size => {0, 128},
+      session_ticket_enabled => true,
+      ocsp_stapling_enabled => true,
+      alps_enabled => false,
+      renegotiation_info_enabled => false
     },
     #{name => edge_120,
       cipher_suites => [
@@ -270,9 +278,11 @@
           [<<"h2">>, <<"http/1.1">>],
           [<<"h2">>]
       ],
-      padding_size => {0, 512},
+      padding_size => {0, 128},
       session_ticket_enabled => true,
-      ocsp_stapling_enabled => true
+      ocsp_stapling_enabled => true,
+      alps_enabled => true,
+      renegotiation_info_enabled => true
     }
 ]).
 
@@ -340,7 +350,6 @@ match_domain(Domain, Allowed) ->
 
 %% ============================================================================
 %% @doc Generate fake OCSP response
-%% @end
 %% ============================================================================
 -spec generate_ocsp_response(binary()) -> binary().
 generate_ocsp_response(_ServerDigest) ->
@@ -405,7 +414,6 @@ generate_session_ticket(_Secret) ->
 %% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
 %% Enhanced with Session Ticket and OCSP support
-%% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
@@ -507,7 +515,6 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
 %% ============================================================================
 %% @doc Backward-compatible version without domain checking.
-%% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary()) ->
                                {ok, iodata(), meta(), codec()}.
@@ -663,7 +670,6 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
 
 %% ============================================================================
 %% @doc Randomly select a TLS fingerprint profile
-%% @end
 %% ============================================================================
 -spec random_tls_profile() -> map().
 random_tls_profile() ->
@@ -933,8 +939,22 @@ build_ocsp_stapling_ext(_) ->
     <<>>.
 
 %% ============================================================================
+%% @doc Build ALPS and Renegotiation extensions dynamically per profile
+%% ============================================================================
+-spec build_alps_ext(map()) -> binary().
+build_alps_ext(#{alps_enabled := true}) ->
+    <<16#44, 16#cd, 16#00, 16#05, 16#00, 16#03, 16#02, $h, $2>>;
+build_alps_ext(_) ->
+    <<>>.
+
+-spec build_renegotiation_info_ext(map()) -> binary().
+build_renegotiation_info_ext(#{renegotiation_info_enabled := true}) ->
+    <<16#ff, 16#01, 16#00, 16#01, 16#00>>;
+build_renegotiation_info_ext(_) ->
+    <<>>.
+
+%% ============================================================================
 %% @doc Build SNI extension
-%% @end
 %% ============================================================================
 make_sni(Domains) ->
     SniListItems = << <<?EXT_SNI_HOST_NAME, (byte_size(Domain)):?u16, Domain/binary>>
@@ -1009,24 +1029,27 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     %% OCSP Stapling extension
     OcspStaplingExt = build_ocsp_stapling_ext(Profile),
 
+    %% Profile-aware dynamic extensions (ALPS & renegotiation_info)
+    AlpsExt = build_alps_ext(Profile),
+    RenegExt = build_renegotiation_info_ext(Profile),
+
     %% Random padding
     PaddingExt = build_padding(Profile),
 
     %% Build extensions list
     ExtensionsBase = [
         ECH,
-        SessionTicketExt,                            % Session Ticket
-        EcPointExt,                                   % EC point formats
-        <<16#44, 16#cd, 16#00, 16#05,
-          16#00, 16#03, 16#02, $h, $2>>,             % application_layer_protocol_settings
+        SessionTicketExt,                             % Session Ticket
+        EcPointExt,                                    % EC point formats
+        AlpsExt,                                      % dynamic ALPS
         KeyShare,
-        <<16#00, 16#12, 0:16>>,                      % signed_certificate_timestamp
+        <<16#00, 16#12, 0:16>>,                       % signed_certificate_timestamp
         SupportedGroups,
         CompCertExt,
-        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,       % renegotiation_info
+        RenegExt,                                     % dynamic renegotiation_info
         SigAlgos,
-        OcspStaplingExt,                              % OCSP Stapling
-        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>, % psk_key_exchange_modes
+        OcspStaplingExt,                               % OCSP Stapling
+        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>,  % psk_key_exchange_modes
         ALPN,
         SNI,
         SupportedVersions,
@@ -1066,7 +1089,6 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
 %% ============================================================================
 %% @doc Parses "ServerHello" (the one produced by from_client_hello/2).
 %% Updated to handle Session Ticket and OCSP responses
-%% @end
 %% ============================================================================
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,

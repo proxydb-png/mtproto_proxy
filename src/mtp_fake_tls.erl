@@ -77,6 +77,7 @@
 -define(TLS_TAG_CLI_HELLO, 1).
 -define(TLS_TAG_SRV_HELLO, 2).
 -define(TLS_TAG_NEW_SESSION_TICKET, 4).
+-define(TLS_TAG_COMPRESSED_CERTIFICATE, 25).
 -define(TLS_CIPHERSUITE, 192, 47).
 -define(TLS_CHANGE_CIPHER, ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1).
 
@@ -358,79 +359,72 @@ match_domain(Domain, Allowed) ->
 %% ============================================================================
 -spec generate_ocsp_response(binary()) -> binary().
 generate_ocsp_response(_ServerDigest) ->
-    %% Generate a realistic-looking OCSP response
-    
     %% OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
     OcspStatus = 0,
     
     %% Basic OCSP Response structure
-    ResponderId = crypto:strong_rand_bytes(20),  % SHA1 hash of responder key
+    ResponderId = crypto:strong_rand_bytes(20),
     ProducedAt = erlang:system_time(seconds),
     ThisUpdate = ProducedAt,
-    NextUpdate = ProducedAt + 604800,  % 7 days validity
+    NextUpdate = ProducedAt + 604800,
     
-    %% Single response for our certificate
     %% CertID ::= SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
     CertId = crypto:strong_rand_bytes(36),
-    CertStatus = <<0>>,  % good
+    CertStatus = <<0>>,
     
     %% SingleResponse ::= SEQUENCE { certID, certStatus, thisUpdate, nextUpdate [0] OPTIONAL }
-    SingleResponse = <<16#30,                       % SEQUENCE tag
+    SingleResponse = <<16#30,
                        (byte_size(CertId) + 1 + 
                         byte_size(encode_generalized_time(ThisUpdate)) +
-                        byte_size(encode_generalized_time(NextUpdate)) + 8),  % rough size
+                        byte_size(encode_generalized_time(NextUpdate)) + 8),
                        CertId/binary,
                        CertStatus/binary,
                        (encode_generalized_time(ThisUpdate))/binary,
-                       16#a0,                        % [0] EXPLICIT tag for nextUpdate
+                       16#a0,
                        (byte_size(encode_generalized_time(NextUpdate))),
                        (encode_generalized_time(NextUpdate))/binary>>,
     
-    %% ResponseData ::= SEQUENCE { version [0], responderID, producedAt, responses, responseExtensions [1] OPTIONAL }
-    Responses = <<16#30,                            % SEQUENCE of SingleResponse
+    %% ResponseData ::= SEQUENCE { version [0], responderID, producedAt, responses }
+    Responses = <<16#30,
                   (byte_size(SingleResponse) + 2),
-                  1:8,                              % length short form
-                  (byte_size(SingleResponse)):8,   % one response
+                  1:8,
+                  (byte_size(SingleResponse)):8,
                   SingleResponse/binary>>,
     
-    ResponseData = <<16#30,                         % SEQUENCE tag for ResponseData
+    ResponseData = <<16#30,
                      (1 + byte_size(ResponderId) + 
                       byte_size(encode_generalized_time(ProducedAt)) +
                       byte_size(Responses) + 6),
-                     0:8, 0:8,                      % version DEFAULT v1
-                     ResponderId/binary,            % responderID byName or byKey
+                     0:8, 0:8,
+                     ResponderId/binary,
                      (encode_generalized_time(ProducedAt))/binary,
                      Responses/binary>>,
     
-    %% Signature with fake algorithm identifier
+    %% Signature with algorithm identifier
     Signature = crypto:strong_rand_bytes(256),
     SignatureAlgorithm = <<16#30, 16#0d, 16#06, 16#09, 16#2a, 16#86, 16#48,
                            16#86, 16#f7, 16#0d, 16#01, 16#01, 16#0b,
-                           16#05, 16#00>>,  % sha256WithRSAEncryption
+                           16#05, 16#00>>,
     
     BasicOcspResponse = <<ResponseData/binary,
                           SignatureAlgorithm/binary,
-                          16#03, (byte_size(Signature)):8, 16#00,  % BIT STRING with 0 unused bits
+                          16#03, (byte_size(Signature)):8, 16#00,
                           Signature/binary>>,
     
     %% Wrap in OCSPResponse with proper ASN.1 encoding
-    %% OCSPResponse ::= SEQUENCE {
-    %%   responseStatus         OCSPResponseStatus,
-    %%   responseBytes          [0] EXPLICIT ResponseBytes OPTIONAL }
+    OcspStatusASN1 = <<16#0a, 16#01, OcspStatus>>,
     
-    OcspStatusASN1 = <<16#0a, 16#01, OcspStatus>>,  % ENUMERATED
-    
-    ResponseBytesContent = <<16#30,                  % SEQUENCE for ResponseBytes
+    ResponseBytesContent = <<16#30,
                              (byte_size(BasicOcspResponse) + 2),
-                             16#06, 16#09,           % OID length 9
-                             16#2b, 16#06, 16#01, 16#05, 16#05, 16#07, 16#30, 16#01, 16#01,  % id-pkix-ocsp-basic
+                             16#06, 16#09,
+                             16#2b, 16#06, 16#01, 16#05, 16#05, 16#07, 16#30, 16#01, 16#01,
                              BasicOcspResponse/binary>>,
     
-    ResponseBytesTagged = <<16#a0,                   % [0] EXPLICIT tag
+    ResponseBytesTagged = <<16#a0,
                             (byte_size(ResponseBytesContent)),
                             ResponseBytesContent/binary>>,
     
-    OuterSeq = <<16#30,                               % SEQUENCE tag for OCSPResponse
+    OuterSeq = <<16#30,
                  (byte_size(OcspStatusASN1) + byte_size(ResponseBytesTagged)),
                  OcspStatusASN1/binary,
                  ResponseBytesTagged/binary>>,
@@ -439,7 +433,6 @@ generate_ocsp_response(_ServerDigest) ->
 
 %% ============================================================================
 %% @doc Encode GeneralizedTime for OCSP (DER format).
-%% Format: YYYYMMDDHHMMSSZ
 %% @end
 %% ============================================================================
 -spec encode_generalized_time(non_neg_integer()) -> binary().
@@ -453,7 +446,7 @@ encode_generalized_time(Timestamp) ->
         [Y, M, D, H, Mi, S]
     ),
     TimeStr = list_to_binary(Str),
-    <<23, (byte_size(TimeStr)), TimeStr/binary>>.  % UTCTime tag
+    <<23, (byte_size(TimeStr)), TimeStr/binary>>.
 
 %% ============================================================================
 %% @doc Generate Session Ticket (RFC 5077 / RFC 8446 §4.6.1)
@@ -464,52 +457,42 @@ generate_session_ticket(_Secret) ->
     TicketAgeAdd = crypto:strong_rand_bytes(4),
     TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
     Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
-    TicketLifetime = 604800,  % 7 days
+    TicketLifetime = 604800,
     
-    %% NewSessionTicket message (TLS 1.3 format)
     <<?TLS_TAG_NEW_SESSION_TICKET,
       (4 + 4 + 1 + byte_size(TicketNonce) + 2 + byte_size(Ticket) + 2):?u24,
       TicketLifetime:32,
       TicketAgeAdd/binary,
       (byte_size(TicketNonce)):8, TicketNonce/binary,
       (byte_size(Ticket)):?u16, Ticket/binary,
-      0:?u16>>.  % No extensions
+      0:?u16>>.
 
 %% ============================================================================
-%% @doc Generate fake compressed certificate message
-%% Based on RFC 8879 CompressCertificate extension
+%% @doc Generate fake compressed certificate message (RFC 8879)
 %% @end
 %% ============================================================================
 -spec generate_compressed_certificate(atom()) -> binary().
 generate_compressed_certificate(brotli) ->
-    %% CompressedCertificate message
-    %% struct {
-    %%     Algorithm algorithm;
-    %%     uint24 uncompressed_length;
-    %%     opaque compressed_certificate_message<1..2^24-1>;
-    %% } CompressedCertificate;
-    
-    %% Generate fake uncompressed certificate (realistic size: 1500-4000 bytes)
     UncompressedSize = 1500 + rand:uniform(2500),
-    UncompressedCert = crypto:strong_rand_bytes(UncompressedSize),
-    
-    %% Fake Brotli compression (just use random bytes as "compressed")
-    CompressedSize = (UncompressedSize * 30) div 100 + rand:uniform(100),  % ~30% of original
+    CompressedSize = (UncompressedSize * 30) div 100 + rand:uniform(100),
     CompressedCert = crypto:strong_rand_bytes(CompressedSize),
     
-    %% Build CompressedCertificate message
-    Payload = <<2:?u16,                     % algorithm: brotli (2)
-               UncompressedSize:?u24,       % uncompressed_length
-               CompressedSize:?u24,         % compressed length (3-byte)
-               CompressedCert/binary>>,      % compressed data
+    Payload = <<2:?u16,
+               UncompressedSize:?u24,
+               CompressedSize:?u24,
+               CompressedCert/binary>>,
     
-    Payload;
+    <<?TLS_TAG_COMPRESSED_CERTIFICATE,
+      (byte_size(Payload)):?u24,
+      Payload/binary>>;
 generate_compressed_certificate(_) ->
     undefined.
 
 %% ============================================================================
-%% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Enhanced with Session Ticket, OCSP and CompressCertificate support
+%% @doc Parse fake-TLS "ClientHello" and generate ServerHello response.
+%% CRITICAL: SrvHello0 and SrvHello MUST have identical structure.
+%% They differ ONLY in the 32-byte digest field.
+%% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
@@ -546,10 +529,24 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     %% Check client capabilities
     HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
     HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
-    HasCompressCert = lists:keymember(16#001b, 1, Extensions),  % compress_certificate
+    HasCompressCert = lists:keymember(16#001b, 1, Extensions),
     
-    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p, CompressCert: ~p", 
-               [HasSessionTicket, HasOcspStapling, HasCompressCert]),
+    %% Determine CompCertAlgo ONCE and use it consistently for both SrvHello0 and SrvHello
+    CompCertAlgo = case HasCompressCert of
+        true ->
+            case lists:keyfind(16#001b, 1, Extensions) of
+                {_, <<_AlgoCount, Algos/binary>>} ->
+                    case binary:match(Algos, <<2>>) of
+                        {_, _} -> brotli;
+                        nomatch -> undefined
+                    end;
+                _ -> undefined
+            end;
+        false -> undefined
+    end,
+    
+    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p, CompressCert: ~p (~p)", 
+               [HasSessionTicket, HasOcspStapling, HasCompressCert, CompCertAlgo]),
 
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
@@ -558,35 +555,28 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         error({protocol_error, tls_invalid_digest, XoredDigest}),
     KeyShare = make_key_share(Extensions),
     
-    %% Determine compress_certificate algorithm from ClientHello
-    CompCertAlgo = case HasCompressCert of
-        true ->
-            case lists:keyfind(16#001b, 1, Extensions) of
-                {_, <<_AlgoCount, Algos/binary>>} ->
-                    case binary:match(Algos, <<2>>) of
-                        {_, _} -> brotli;      % Brotli supported
-                        nomatch -> undefined
-                    end;
-                _ -> undefined
-            end;
-        false -> undefined
-    end,
+    %% ============================================================
+    %% CRITICAL FIX: Build SrvHello0 and SrvHello with IDENTICAL structure
+    %% Both use the SAME SessionId, KeyShare, HasSessionTicket, HasOcspStapling, CompCertAlgo
+    %% The ONLY difference is the 32-byte digest field
+    %% ============================================================
     
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare, 
-                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
-    FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
+    %% Generate all extra records BEFORE building ServerHello
+    %% This ensures Response0 structure is final and won't change
     
-    %% Generate Session Ticket if client supports it
+    %% Fake HTTP data
+    FakeHttpData = crypto:strong_rand_bytes(rand:uniform(128) + 64),
+    
+    %% Session Ticket
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
             Ticket = generate_session_ticket(Secret),
-            TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
-            {Ticket, TicketRecord2};
+            {Ticket, as_tls_frame(?TLS_REC_HANDSHAKE, Ticket)};
         false ->
             {undefined, <<>>}
     end,
     
-    %% Generate OCSP response if client supports it
+    %% OCSP Response
     OcspResponse = case HasOcspStapling of
         true ->
             generate_ocsp_response(ServerDigest);
@@ -594,7 +584,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             undefined
     end,
     
-    %% Generate CompressedCertificate if supported
+    %% Compressed Certificate
     CompCertRecord = case CompCertAlgo of
         brotli ->
             CompCertMsg = generate_compressed_certificate(brotli),
@@ -603,23 +593,27 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             <<>>
     end,
     
-    %% Build initial response without proper digest
-    Response0 = [_, CC, DD, ST, CP] =
-        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-         TicketRecord,
-         CompCertRecord],
+    %% Build SrvHello0 with zero digest (same structure as final SrvHello)
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare, 
+                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
     
-    %% Calculate digest with complete response
+    %% Build Response0 - this is what gets hashed
+    ChangeCipherFrame = as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
+    DataFrame = as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+    SrvHelloFrame0 = as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+    
+    Response0 = [SrvHelloFrame0, ChangeCipherFrame, DataFrame, TicketRecord, CompCertRecord],
+    
+    %% Calculate digest using the COMPLETE Response0
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
+    
+    %% Build final SrvHello with real digest (SAME structure as SrvHello0)
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
-    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-                CC,
-                DD,
-                ST,
-                CP],
+    SrvHelloFrame = as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
+    
+    %% Build final Response
+    Response = [SrvHelloFrame, ChangeCipherFrame, DataFrame, TicketRecord, CompCertRecord],
     
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
@@ -733,16 +727,16 @@ make_key_share(Exts) ->
                             andalso
                             lists:member(
                               Group, [
-                                      16#0017,  % secp256r1
-                                      16#0018,  % secp384r1
-                                      16#0019,  % secp521r1
-                                      16#001D,  % x25519
-                                      16#001E,  % x448
-                                      16#0100,  % ffdhe2048
-                                      16#0101,  % ffdhe3072
-                                      16#0102,  % ffdhe4096
-                                      16#0103,  % ffdhe6144
-                                      16#0104   % ffdhe8192
+                                      16#0017,
+                                      16#0018,
+                                      16#0019,
+                                      16#001D,
+                                      16#001E,
+                                      16#0100,
+                                      16#0101,
+                                      16#0102,
+                                      16#0103,
+                                      16#0104
                               ])
                            )
                   end, KeyShares),
@@ -756,6 +750,10 @@ make_key_share(Exts) ->
             error({protocol_error, tls_missing_key_share_ext, Exts})
     end.
 
+%% ============================================================================
+%% @doc Build ServerHello message.
+%% NOTE: SrvHello0 and SrvHello MUST use identical parameters except digest.
+%% ============================================================================
 make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, 
                HasSessionTicket, HasOcspStapling, CompCertAlgo) ->
     KeyShareEntity = <<KeyShareGroup:?u16, (byte_size(KeyShareKey)):?u16, KeyShareKey/binary>>,
@@ -781,10 +779,9 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
             ExtensionsWithTicket
     end,
     
-    %% Add CompressCertificate extension if client supports it
+    %% Add CompressCertificate extension if negotiated
     ExtensionsFinal = case CompCertAlgo of
         brotli ->
-            %% Only advertise Brotli support
             ExtensionsWithOCSP ++ [<<16#00, 16#1b, 16#00, 16#03, 16#02, 16#02, 16#00>>];
         _ ->
             ExtensionsWithOCSP
@@ -838,14 +835,12 @@ build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, Greas
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
-    %% Interleave GREASE values at random positions
     WithGrease = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, Suites, GreaseVals),
     
-    %% Randomize order if profile says so
     Final = case maps:get(cipher_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
@@ -862,10 +857,8 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
-    %% GREASE entries (group + 1-byte key)
     GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
     
-    %% Real key share entries
     RealEntries = [
         begin
             KeySize = key_size_for_group(Group),
@@ -875,7 +868,6 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
         || Group <- Groups
     ],
     
-    %% Interleave GREASE randomly
     AllEntries = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
@@ -889,11 +881,11 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
 %% @end
 %% ============================================================================
 -spec key_size_for_group(non_neg_integer()) -> non_neg_integer().
-key_size_for_group(16#001D) -> 32;    % x25519
-key_size_for_group(16#0017) -> 65;    % secp256r1 (uncompressed)
-key_size_for_group(16#0018) -> 97;    % secp384r1
-key_size_for_group(16#0019) -> 133;   % secp521r1
-key_size_for_group(16#11EC) -> 1216;  % X25519MLKEM768
+key_size_for_group(16#001D) -> 32;
+key_size_for_group(16#0017) -> 65;
+key_size_for_group(16#0018) -> 97;
+key_size_for_group(16#0019) -> 133;
+key_size_for_group(16#11EC) -> 1216;
 key_size_for_group(_) -> 32.
 
 %% ============================================================================
@@ -926,17 +918,17 @@ build_supported_versions_ext(#{supported_versions := Versions,
 -spec build_sig_algos(map()) -> binary().
 build_sig_algos(#{sig_algorithms_count := Count}) ->
     AllAlgos = [
-        16#04, 16#03,   % ecdsa_secp256r1_sha256
-        16#05, 16#03,   % ecdsa_secp384r1_sha384
-        16#06, 16#03,   % ecdsa_secp521r1_sha512
-        16#02, 16#03,   % ecdsa_sha1
-        16#08, 16#04,   % rsa_pss_rsae_sha256
-        16#08, 16#05,   % rsa_pss_rsae_sha384
-        16#08, 16#06,   % rsa_pss_rsae_sha512
-        16#04, 16#01,   % rsa_pkcs1_sha256
-        16#05, 16#01,   % rsa_pkcs1_sha384
-        16#06, 16#01,   % rsa_pkcs1_sha512
-        16#02, 16#01,   % rsa_pkcs1_sha1
+        16#04, 16#03,
+        16#05, 16#03,
+        16#06, 16#03,
+        16#02, 16#03,
+        16#08, 16#04,
+        16#08, 16#05,
+        16#08, 16#06,
+        16#04, 16#01,
+        16#05, 16#01,
+        16#06, 16#01,
+        16#02, 16#01,
         16#04, 16#02,
         16#03, 16#02,
         16#02, 16#02,
@@ -946,9 +938,9 @@ build_sig_algos(#{sig_algorithms_count := Count}) ->
     Shuffled = shuffle_list(Selected),
     AlgoListLen = Count * 2,
     ExtLen = AlgoListLen + 2,
-    <<16#00, 16#0d,             % signature_algorithms
-      ExtLen:?u16,               % ext length
-      AlgoListLen:?u16,          % list length
+    <<16#00, 16#0d,
+      ExtLen:?u16,
+      AlgoListLen:?u16,
       << <<A:8>> || A <- Shuffled >>/binary>>.
 
 %% ============================================================================
@@ -983,9 +975,9 @@ build_alpn(#{alpn_protocols := Protocols}) ->
     Selected = lists:nth(rand:uniform(length(Protocols)), Protocols),
     ProtocolEntries = << <<(byte_size(P)):8, P/binary>> || P <- Selected >>,
     ProtocolsLen = byte_size(ProtocolEntries),
-    <<16#00, 16#10,              % application_layer_protocol_negotiation
-      (ProtocolsLen + 2):?u16,    % ext length
-      ProtocolsLen:?u16,          % list length
+    <<16#00, 16#10,
+      (ProtocolsLen + 2):?u16,
+      ProtocolsLen:?u16,
       ProtocolEntries/binary>>;
 build_alpn(_) ->
     <<>>.
@@ -1019,7 +1011,6 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
-    %% Interleave GREASE
     WithGrease = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
@@ -1028,9 +1019,9 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
     
     GroupsBin = << <<G:?u16>> || G <- WithGrease >>,
     GroupsLen = byte_size(GroupsBin),
-    <<16#00, 16#0a,              % supported_groups
-      (GroupsLen + 2):?u16,       % ext length
-      GroupsLen:?u16,             % list length
+    <<16#00, 16#0a,
+      (GroupsLen + 2):?u16,
+      GroupsLen:?u16,
       GroupsBin/binary>>.
 
 %% ============================================================================
@@ -1055,7 +1046,6 @@ build_padding(_) ->
 %% ============================================================================
 -spec build_session_ticket_ext(map()) -> binary().
 build_session_ticket_ext(#{session_ticket_enabled := true}) ->
-    %% Empty session ticket extension - client indicates support
     <<?EXT_SESSION_TICKET:?u16, 0:?u16>>;
 build_session_ticket_ext(_) ->
     <<>>.
@@ -1066,7 +1056,6 @@ build_session_ticket_ext(_) ->
 %% ============================================================================
 -spec build_ocsp_stapling_ext(map()) -> binary().
 build_ocsp_stapling_ext(#{ocsp_stapling_enabled := true}) ->
-    %% status_request extension with OCSP type
     <<?EXT_STATUS_REQUEST:?u16, 0:?u16>>;
 build_ocsp_stapling_ext(_) ->
     <<>>.
@@ -1096,7 +1085,7 @@ make_sni(Domains) ->
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
 %% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with random fingerprint and full extension support.
+%% @doc Generate Fake-TLS "ClientHello" with random fingerprint.
 %% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
@@ -1109,87 +1098,58 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain) when byte_size(Hex
     make_client_hello(Timestamp, SessionId, mtp_handler:unhex(HexSecret), SniDomain);
 make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(SessionId) == 32,
                                                                 byte_size(Secret) == 16 ->
-    %% ============================================================
-    %% Random TLS Fingerprint Profile Selection
-    %% ============================================================
     Profile = random_tls_profile(),
 
-    %% Cipher suites with GREASE and optional randomization
     CipherSuites = build_cipher_suites(Profile),
-
-    %% SNI
     SNI = make_sni([SniDomain]),
-
-    %% Signature algorithms
     SigAlgos = build_sig_algos(Profile),
-
-    %% Supported groups with GREASE
     SupportedGroups = build_supported_groups(Profile),
-
-    %% Supported versions with GREASE
+    
     SupportedVersionsExt = build_supported_versions_ext(Profile),
     VersionsLen = byte_size(SupportedVersionsExt),
     SupportedVersions =
-        <<16#00, 16#2b,              % supported_versions
-          (VersionsLen + 1):?u16,     % ext length
-          VersionsLen,                % list length
+        <<16#00, 16#2b,
+          (VersionsLen + 1):?u16,
+          VersionsLen,
           SupportedVersionsExt/binary>>,
 
-    %% Key share with GREASE
     KeyShareEntries = build_key_share_entries(Profile),
     KSListLen = byte_size(KeyShareEntries),
     KeyShare =
-        <<16#00, 16#33,              % key_share
-          (KSListLen + 2):?u16,       % ext length
+        <<16#00, 16#33,
+          (KSListLen + 2):?u16,
           KSListLen:?u16,
           KeyShareEntries/binary>>,
 
-    %% ECH
     ECH = build_ech(Profile),
-
-    %% ALPN
     ALPN = build_alpn(Profile),
-
-    %% Compress certificate
     CompCertExt = build_compress_certificate(Profile),
-
-    %% EC point formats
     EcPointExt = build_ec_point_formats(Profile),
-
-    %% Session Ticket extension
     SessionTicketExt = build_session_ticket_ext(Profile),
-
-    %% OCSP Stapling extension
     OcspStaplingExt = build_ocsp_stapling_ext(Profile),
-
-    %% Profile-aware dynamic extensions (ALPS & renegotiation_info)
     AlpsExt = build_alps_ext(Profile),
     RenegExt = build_renegotiation_info_ext(Profile),
-
-    %% Random padding
     PaddingExt = build_padding(Profile),
 
-    %% Build extensions list
     ExtensionsBase = [
         ECH,
-        SessionTicketExt,                             % Session Ticket
-        EcPointExt,                                    % EC point formats
-        AlpsExt,                                      % dynamic ALPS
+        SessionTicketExt,
+        EcPointExt,
+        AlpsExt,
         KeyShare,
-        <<16#00, 16#12, 0:16>>,                       % signed_certificate_timestamp
+        <<16#00, 16#12, 0:16>>,
         SupportedGroups,
-        CompCertExt,                                   % compress_certificate
-        RenegExt,                                     % dynamic renegotiation_info
+        CompCertExt,
+        RenegExt,
         SigAlgos,
-        OcspStaplingExt,                               % OCSP Stapling
-        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>,  % psk_key_exchange_modes
+        OcspStaplingExt,
+        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>,
         ALPN,
         SNI,
         SupportedVersions,
         PaddingExt
     ],
 
-    %% Filter empty and optionally randomize order
     NonEmpty = [E || E <- ExtensionsBase, E =/= <<>>],
     Extensions = case maps:get(extensions_order_randomized, Profile, false) of
         true -> shuffle_list(NonEmpty);
@@ -1233,7 +1193,6 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
                      ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
                      Tail/binary>>) ->
-    %% ServerHello with Session Ticket
     {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
@@ -1241,7 +1200,6 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
                      ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, CompCertLen:?u16, _CompCert:CompCertLen/binary,
                      Tail/binary>>) ->
-    %% ServerHello with Session Ticket and CompressedCertificate
     {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;

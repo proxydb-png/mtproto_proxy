@@ -383,12 +383,12 @@ parse_upstream_data(<<?TLS_START, _/binary>> = AllData,
             EffSecret = effective_secret(Data, Secret),
             
             %% ============================================================
-            %% Read allowed TLS domains from config
+            %% NEW: Read allowed TLS domains from config
             %% ============================================================
             AllowedTlsDomains = application:get_env(?APP, allowed_tls_domains, []),
             
             %% ============================================================
-            %% Call from_client_hello with domain restriction
+            %% NEW: Call from_client_hello with domain restriction
             %% ============================================================
             {ok, Response, Meta, TlsCodec} = 
                 case AllowedTlsDomains of
@@ -404,23 +404,7 @@ parse_upstream_data(<<?TLS_START, _/binary>> = AllData,
             check_tls_policy(Listener, Ip, Meta),
             Codec1 = mtp_codec:replace(tls, true, TlsCodec, Codec0),
             Codec = mtp_codec:push_back(tls, Tail, Codec1),
-            
-            %% ============================================================
-            %% Send Flight 1: ServerHello + CCS + Data (for Telegram X)
-            %% ============================================================
-            ok = up_send_raw(Response, S),
-            
-            %% ============================================================
-            %% Send Flight 2: Certificate + CertVerify + Finished + Padding (for DPI)
-            %% These are sent immediately after Flight 1 to mimic complete TLS 1.3 handshake
-            %% Telegram X ignores these extra records (skipped in try_decode_packet)
-            %% ============================================================
-            PostCcsRecords = mtp_fake_tls:get_post_ccs_records(TlsCodec),
-            case iolist_size(PostCcsRecords) of
-                0 -> ok;
-                _ -> ok = up_send_raw(PostCcsRecords, S)
-            end,
-            
+            ok = up_send_raw(Response, S),        %FIXME: if this send fail, we will get counter policy leak
             {ok, S#state{codec = Codec, stage = init, secret = EffSecret,
                          policy_state = {ok, maps:get(sni_domain, Meta, undefined)}}};
         false ->
@@ -556,7 +540,7 @@ attempt_fronting(tls_invalid_digest, _Extra,
             end
     end;
 %% ============================================================
-%% Handle tls_domain_not_allowed error
+%% NEW: Handle tls_domain_not_allowed error
 %% ============================================================
 attempt_fronting(tls_domain_not_allowed, Domain,
                  #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S) ->
@@ -570,8 +554,8 @@ attempt_fronting(replay_session_detected, SniDomain,
                  #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S)
   when is_binary(SniDomain) ->
     %% Replay detected at ClientHello level (before ServerHello was sent).
-    %% hello_acc = raw ClientHello bytes -> forward to fronting host which responds with
-    %% a real ServerHello - transparent forward, no TLS breakage.
+    %% hello_acc = raw ClientHello bytes → forward to fronting host which responds with
+    %% a real ServerHello — transparent forward, no TLS breakage.
     case application:get_env(?APP, domain_fronting, off) of
         off -> skip;
         Config ->
@@ -600,7 +584,7 @@ maybe_check_replay_tls(#{client_digest := Digest} = Meta) ->
 
 %% Select the secret to use for fake-TLS ClientHello validation.
 %% When per_sni_secrets=on, derive a domain-specific 16-byte secret so that each
-%% SNI domain gets a unique token - users cannot recover the base secret from their link.
+%% SNI domain gets a unique token — users cannot recover the base secret from their link.
 effective_secret(Data, Secret) ->
     case application:get_env(?APP, per_sni_secrets, off) of
         off ->
@@ -612,7 +596,7 @@ effective_secret(Data, Secret) ->
                 {ok, Sni} ->
                     mtp_fake_tls:derive_sni_secret(Secret, Sni, Salt);
                 {error, Reason} ->
-                    %% No SNI - not a valid fake-TLS MTP connection; fail fast.
+                    %% No SNI — not a valid fake-TLS MTP connection; fail fast.
                     error({protocol_error, tls_bad_client_hello, Reason})
             end
     end.
@@ -691,8 +675,7 @@ down_send(Packet, #state{down = Down, listener = Listener, dc_id = Dc} = S) ->
 
 handle_unknown_upstream(#state{down = Down, sock = USock, transport = UTrans} = S) ->
     %% there might be a race-condition between packets from upstream socket and
-    %% downstream's 'close_ext' message. Most likely because of slow up_send
-    ok = UTrans:close(USock),
+    %% downstream's 'close_ext' message. Most likely because of slow up_send    ok = UTrans:close(USock),
     receive
         {'$gen_cast', {close_ext, Down}} ->
             ?LOG_DEBUG("asked to close connection by downstream"),

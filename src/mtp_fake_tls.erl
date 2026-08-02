@@ -368,15 +368,22 @@ generate_ocsp_response(_ServerDigest) ->
     <<OcspStatus, (byte_size(BasicOcspResponse)):?u24, BasicOcspResponse/binary>>.
 
 %% ============================================================================
-%% @doc Encode GeneralizedTime for OCSP
+%% @doc Encode GeneralizedTime for OCSP.
+%%
+%% The timestamp is encoded directly as UTC. The trailing "Z" is therefore
+%% correct and must not be used with local time.
 %% @end
 %% ============================================================================
 -spec encode_generalized_time(non_neg_integer()) -> binary().
 encode_generalized_time(Timestamp) ->
-    {{Y, M, D}, {H, Mi, S}} = calendar:universal_time_to_local_time(
-        calendar:gregorian_seconds_to_datetime(Timestamp + 62167219200)
+    {{Y, M, D}, {H, Mi, S}} =
+        calendar:gregorian_seconds_to_datetime(
+            Timestamp + 62167219200
+        ),
+    Str = io_lib:format(
+        "~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ",
+        [Y, M, D, H, Mi, S]
     ),
-    Str = io_lib:format("~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ", [Y, M, D, H, Mi, S]),
     list_to_binary(Str).
 
 %% ============================================================================

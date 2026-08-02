@@ -8,6 +8,20 @@
 %%% Added Session Ticket and OCSP stapling support
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
+%%%
+%%% NOTE (fix log):
+%%%   The fingerprint profiles below store each TLS constant (cipher
+%%%   suite, named group, protocol version) as a *single* 16-bit
+%%%   integer, e.g. 16#1301 rather than as two separate bytes
+%%%   `16#13, 16#01`. The old byte-pair representation looked correct
+%%%   on paper but was flattened by `<<S:16>> || S <- List>>`-style
+%%%   binary comprehensions, which silently turned every constant into
+%%%   two bogus 16-bit values instead of one real one. That broke
+%%%   cipher_suites, key_share_groups and supported_versions in every
+%%%   generated ClientHello. `build_sig_algos/1` had the same class of
+%%%   bug: it shuffled individual bytes instead of the
+%%%   (signature, hash) pairs they belong to, which un-pairs the
+%%%   algorithm IDs. Both are fixed here.
 
 -module(mtp_fake_tls).
 
@@ -98,38 +112,44 @@
 %% ============================================================================
 %% TLS Fingerprint Profiles - randomized per connection
 %% Each profile mimics a different real browser/TLS implementation
+%%
+%% IMPORTANT: cipher_suites / key_share_groups / supported_versions are
+%% lists of *single* 16-bit integers (one constant per element), NOT
+%% flattened byte pairs. This matches how build_cipher_suites/1,
+%% build_supported_groups/1, build_supported_versions_ext/1 and
+%% build_key_share_entries/1 consume them (`<<X:?u16>>` per element).
 %% ============================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
     #{name => chrome_120,
       cipher_suites => [
-          16#13, 16#01,   % TLS_AES_128_GCM_SHA256
-          16#13, 16#02,   % TLS_AES_256_GCM_SHA384
-          16#13, 16#03,   % TLS_CHACHA20_POLY1305_SHA256
-          16#c0, 16#2b,   % ECDHE_ECDSA_AES128_GCM_SHA256
-          16#c0, 16#2f,   % ECDHE_RSA_AES128_GCM_SHA256
-          16#c0, 16#2c,   % ECDHE_ECDSA_AES256_GCM_SHA384
-          16#c0, 16#30,   % ECDHE_RSA_AES256_GCM_SHA384
-          16#cc, 16#a9,   % ECDHE_ECDSA_CHACHA20_POLY1305
-          16#cc, 16#a8,   % ECDHE_RSA_CHACHA20_POLY1305
-          16#c0, 16#13,   % ECDHE_RSA_AES128_CBC_SHA
-          16#c0, 16#14,   % ECDHE_RSA_AES256_CBC_SHA
-          16#00, 16#9c,   % RSA_AES128_GCM_SHA256
-          16#00, 16#9d,   % RSA_AES256_GCM_SHA384
-          16#00, 16#2f,   % RSA_AES128_CBC_SHA
-          16#00, 16#35    % RSA_AES256_CBC_SHA
+          16#1301,   % TLS_AES_128_GCM_SHA256
+          16#1302,   % TLS_AES_256_GCM_SHA384
+          16#1303,   % TLS_CHACHA20_POLY1305_SHA256
+          16#c02b,   % ECDHE_ECDSA_AES128_GCM_SHA256
+          16#c02f,   % ECDHE_RSA_AES128_GCM_SHA256
+          16#c02c,   % ECDHE_ECDSA_AES256_GCM_SHA384
+          16#c030,   % ECDHE_RSA_AES256_GCM_SHA384
+          16#cca9,   % ECDHE_ECDSA_CHACHA20_POLY1305
+          16#cca8,   % ECDHE_RSA_CHACHA20_POLY1305
+          16#c013,   % ECDHE_RSA_AES128_CBC_SHA
+          16#c014,   % ECDHE_RSA_AES256_CBC_SHA
+          16#009c,   % RSA_AES128_GCM_SHA256
+          16#009d,   % RSA_AES256_GCM_SHA384
+          16#002f,   % RSA_AES128_CBC_SHA
+          16#0035    % RSA_AES256_CBC_SHA
       ],
       cipher_order_randomized => true,
       grease_count => {2, 4},
       key_share_groups => [
-          16#11, 16#ec,   % X25519MLKEM768
-          16#00, 16#1d,   % x25519
-          16#00, 16#17,   % secp256r1
-          16#00, 16#18    % secp384r1
+          16#11ec,   % X25519MLKEM768
+          16#001d,   % x25519
+          16#0017,   % secp256r1
+          16#0018    % secp384r1
       ],
       supported_versions => [
-          16#03, 16#04,   % TLS 1.3
-          16#03, 16#03    % TLS 1.2
+          16#0304,   % TLS 1.3
+          16#0303    % TLS 1.2
       ],
       version_order_randomized => true,
       sig_algorithms_count => 15,
@@ -149,36 +169,36 @@
     },
     #{name => firefox_121,
       cipher_suites => [
-          16#13, 16#01,
-          16#13, 16#02,
-          16#13, 16#03,
-          16#c0, 16#2b,
-          16#c0, 16#2f,
-          16#c0, 16#2c,
-          16#c0, 16#30,
-          16#cc, 16#a9,
-          16#cc, 16#a8,
-          16#c0, 16#13,
-          16#c0, 16#14,
-          16#00, 16#9c,
-          16#00, 16#9d,
-          16#00, 16#2f,
-          16#00, 16#35,
-          16#00, 16#3c,
-          16#00, 16#3d
+          16#1301,
+          16#1302,
+          16#1303,
+          16#c02b,
+          16#c02f,
+          16#c02c,
+          16#c030,
+          16#cca9,
+          16#cca8,
+          16#c013,
+          16#c014,
+          16#009c,
+          16#009d,
+          16#002f,
+          16#0035,
+          16#003c,
+          16#003d
       ],
       cipher_order_randomized => true,
       grease_count => {2, 3},
       key_share_groups => [
-          16#00, 16#1d,
-          16#00, 16#17
+          16#001d,
+          16#0017
       ],
       supported_versions => [
-          16#03, 16#04,
-          16#03, 16#03
+          16#0304,
+          16#0303
       ],
       version_order_randomized => false,
-      sig_algorithms_count => 17,
+      sig_algorithms_count => 15,
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [144, 176],
@@ -193,28 +213,28 @@
     },
     #{name => safari_17,
       cipher_suites => [
-          16#13, 16#01,
-          16#13, 16#02,
-          16#13, 16#03,
-          16#c0, 16#2b,
-          16#c0, 16#2f,
-          16#c0, 16#2c,
-          16#c0, 16#30,
-          16#cc, 16#a9,
-          16#cc, 16#a8,
-          16#c0, 16#13,
-          16#c0, 16#14
+          16#1301,
+          16#1302,
+          16#1303,
+          16#c02b,
+          16#c02f,
+          16#c02c,
+          16#c030,
+          16#cca9,
+          16#cca8,
+          16#c013,
+          16#c014
       ],
       cipher_order_randomized => false,
       grease_count => {2, 4},
       key_share_groups => [
-          16#00, 16#1d,
-          16#00, 16#17,
-          16#00, 16#18,
-          16#00, 16#19
+          16#001d,
+          16#0017,
+          16#0018,
+          16#0019
       ],
       supported_versions => [
-          16#03, 16#04
+          16#0304
       ],
       version_order_randomized => false,
       sig_algorithms_count => 13,
@@ -232,35 +252,35 @@
     },
     #{name => edge_120,
       cipher_suites => [
-          16#13, 16#01,
-          16#13, 16#02,
-          16#13, 16#03,
-          16#c0, 16#2b,
-          16#c0, 16#2f,
-          16#c0, 16#2c,
-          16#c0, 16#30,
-          16#cc, 16#a9,
-          16#cc, 16#a8,
-          16#c0, 16#13,
-          16#c0, 16#14,
-          16#00, 16#9c,
-          16#00, 16#9d,
-          16#00, 16#2f,
-          16#00, 16#35
+          16#1301,
+          16#1302,
+          16#1303,
+          16#c02b,
+          16#c02f,
+          16#c02c,
+          16#c030,
+          16#cca9,
+          16#cca8,
+          16#c013,
+          16#c014,
+          16#009c,
+          16#009d,
+          16#002f,
+          16#0035
       ],
       cipher_order_randomized => true,
       grease_count => {2, 4},
       key_share_groups => [
-          16#11, 16#ec,
-          16#00, 16#1d,
-          16#00, 16#17
+          16#11ec,
+          16#001d,
+          16#0017
       ],
       supported_versions => [
-          16#03, 16#04,
-          16#03, 16#03
+          16#0304,
+          16#0303
       ],
       version_order_randomized => true,
-      sig_algorithms_count => 16,
+      sig_algorithms_count => 15,
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [176, 208],
@@ -356,11 +376,11 @@ generate_ocsp_response(_ServerDigest) ->
     %% Single response for our certificate
     CertId = crypto:strong_rand_bytes(36),  % HashAlgorithm + IssuerNameHash + IssuerKeyHash + SerialNumber
     CertStatus = <<0>>,  % good
-    SingleResponse = <<CertId/binary, CertStatus/binary, 
+    SingleResponse = <<CertId/binary, CertStatus/binary,
                         (encode_generalized_time(ThisUpdate))/binary,
                         (encode_generalized_time(NextUpdate))/binary>>,
     Responses = <<1:32, SingleResponse/binary>>,
-    ResponseData = <<0, ResponderId/binary, 
+    ResponseData = <<0, ResponderId/binary,
                      (encode_generalized_time(ProducedAt))/binary,
                      Responses/binary>>,
     Signature = crypto:strong_rand_bytes(256),
@@ -389,8 +409,8 @@ generate_session_ticket(_Secret) ->
     TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
     Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
     TicketLifetime = 604800,  % 7 days
-    
-    <<TicketLifetime:32, TicketAgeAdd/binary, 
+
+    <<TicketLifetime:32, TicketAgeAdd/binary,
       (byte_size(TicketNonce)):8, TicketNonce/binary,
       (byte_size(Ticket)):?u16, Ticket/binary,
       0:?u16>>.  % No extensions
@@ -435,8 +455,8 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     %% Check if client supports session ticket and OCSP
     HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
     HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
-    
-    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p", 
+
+    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p",
                [HasSessionTicket, HasOcspStapling]),
 
     ServerDigest = make_server_digest(Data, Secret),
@@ -445,10 +465,10 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
         error({protocol_error, tls_invalid_digest, XoredDigest}),
     KeyShare = make_key_share(Extensions),
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare, 
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare,
                                HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
-    
+
     %% Generate Session Ticket if client supports it
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
@@ -458,7 +478,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         false ->
             {undefined, <<>>}
     end,
-    
+
     %% Generate OCSP response if client supports it
     OcspResponse = case HasOcspStapling of
         true ->
@@ -466,30 +486,30 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         false ->
             undefined
     end,
-    
+
     %% Build initial response without proper digest
     Response0 = [_, CC, DD, ST] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
          as_tls_frame(?TLS_REC_DATA, FakeHttpData),
          TicketRecord],
-    
+
     %% Calculate digest with complete response
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
                               HasSessionTicket, HasOcspStapling),
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
                 DD,
                 ST],
-    
+
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
               client_digest => ClientDigest,
               sni_domain => SniDomain},
     Meta = Meta0#{session_ticket => SessionTicket,
                   ocsp_response => OcspResponse},
-    
+
     St = #st{session_ticket = SessionTicket,
              ocsp_response = OcspResponse,
              session_ticket_lifetime = case HasSessionTicket of
@@ -618,15 +638,15 @@ make_key_share(Exts) ->
             error({protocol_error, tls_missing_key_share_ext, Exts})
     end.
 
-make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, 
+make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
                HasSessionTicket, HasOcspStapling) ->
     KeyShareEntity = <<KeyShareGroup:?u16, (byte_size(KeyShareKey)):?u16, KeyShareKey/binary>>,
-    
+
     ExtensionsBase = [
         <<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16, KeyShareEntity/binary>>,
         <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>
     ],
-    
+
     %% Add Session Ticket extension if client supports it
     ExtensionsWithTicket = case HasSessionTicket of
         true ->
@@ -634,7 +654,7 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
         false ->
             ExtensionsBase
     end,
-    
+
     %% Add OCSP stapling extension if client supports it
     ExtensionsFinal = case HasOcspStapling of
         true ->
@@ -642,7 +662,7 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
         false ->
             ExtensionsWithTicket
     end,
-    
+
     SessionSize = byte_size(SessionId),
     Payload = [<<?TLS_12_VERSION,
                  Digest:?DIGEST_LEN/binary,
@@ -674,7 +694,7 @@ random_grease(Count) ->
     [lists:nth(rand:uniform(length(?GREASE_VALUES)), ?GREASE_VALUES) || _ <- lists:seq(1, Count)].
 
 %% ============================================================================
-%% @doc Fisher-Yates shuffle for lists
+%% @doc Fisher-Yates-ish shuffle for lists (uniform random-key sort)
 %% @end
 %% ============================================================================
 -spec shuffle_list(list()) -> list().
@@ -684,41 +704,51 @@ shuffle_list(List) ->
     [X || {_, X} <- Sorted].
 
 %% ============================================================================
-%% @doc Build cipher suites binary with GREASE and optional order randomization
+%% @doc Insert Elems at random positions inside List, one at a time.
+%% Shared helper used to interleave GREASE values without duplicating
+%% the fold-with-random-position pattern everywhere.
+%% @end
+%% ============================================================================
+-spec interleave_random(list(), list()) -> list().
+interleave_random(List, Elems) ->
+    lists:foldl(
+      fun(E, Acc) ->
+              Pos = rand:uniform(length(Acc) + 1),
+              lists:sublist(Acc, Pos - 1) ++ [E] ++ lists:nthtail(Pos - 1, Acc)
+      end, List, Elems).
+
+-spec grease_for(map()) -> [non_neg_integer()].
+grease_for(#{grease_count := {GreaseMin, GreaseMax}}) ->
+    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
+    random_grease(GreaseCount).
+
+%% ============================================================================
+%% @doc Build cipher suites binary with GREASE and optional order randomization.
+%% `Suites` is a list of full 16-bit cipher-suite IDs (see profile table).
 %% @end
 %% ============================================================================
 -spec build_cipher_suites(map()) -> binary().
-build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    %% Interleave GREASE values at random positions
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Suites, GreaseVals),
-    
-    %% Randomize order if profile says so
+build_cipher_suites(#{cipher_suites := Suites} = Profile) ->
+    GreaseVals = grease_for(Profile),
+    WithGrease = interleave_random(Suites, GreaseVals),
     Final = case maps:get(cipher_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
     end,
-    
     << <<S:?u16>> || S <- Final >>.
 
 %% ============================================================================
-%% @doc Build key share entries with GREASE
+%% @doc Build key share entries with GREASE.
+%% `Groups` is a list of full 16-bit named-group IDs.
 %% @end
 %% ============================================================================
 -spec build_key_share_entries(map()) -> binary().
-build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    %% GREASE entries (group + 1-byte key)
-    GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
-    
+build_key_share_entries(#{key_share_groups := Groups} = Profile) ->
+    GreaseVals = grease_for(Profile),
+
+    %% GREASE entries (group + 1-byte dummy key), per RFC 8701 §4.
+    GreaseEntries = [<<G:?u16, 16#0001:?u16, 16#00>> || G <- GreaseVals],
+
     %% Real key share entries
     RealEntries = [
         begin
@@ -728,18 +758,12 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
         end
         || Group <- Groups
     ],
-    
-    %% Interleave GREASE randomly
-    AllEntries = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, RealEntries, GreaseEntries),
-    
+
+    AllEntries = interleave_random(RealEntries, GreaseEntries),
     iolist_to_binary(AllEntries).
 
 %% ============================================================================
-%% @doc Get key size for a given TLS group
+%% @doc Get key size for a given TLS named group
 %% @end
 %% ============================================================================
 -spec key_size_for_group(non_neg_integer()) -> non_neg_integer().
@@ -751,59 +775,54 @@ key_size_for_group(16#11EC) -> 1216;  % X25519MLKEM768
 key_size_for_group(_) -> 32.
 
 %% ============================================================================
-%% @doc Build supported versions extension with GREASE
+%% @doc Build supported versions extension with GREASE.
+%% `Versions` is a list of full 16-bit version values (e.g. 16#0304).
 %% @end
 %% ============================================================================
 -spec build_supported_versions_ext(map()) -> binary().
-build_supported_versions_ext(#{supported_versions := Versions, 
-                               grease_count := {GreaseMin, GreaseMax}} = Profile) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Versions, GreaseVals),
-    
+build_supported_versions_ext(#{supported_versions := Versions} = Profile) ->
+    GreaseVals = grease_for(Profile),
+    WithGrease = interleave_random(Versions, GreaseVals),
     Final = case maps:get(version_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
     end,
-    
     << <<V:?u16>> || V <- Final >>.
 
 %% ============================================================================
-%% @doc Build signature algorithms from profile
+%% @doc Build signature algorithms from profile.
+%% Algorithms are (signature, hash) *pairs*; we shuffle whole pairs, not
+%% individual bytes, so IDs like rsa_pss_rsae_sha256 (16#0804) stay intact.
 %% @end
 %% ============================================================================
 -spec build_sig_algos(map()) -> binary().
 build_sig_algos(#{sig_algorithms_count := Count}) ->
     AllAlgos = [
-        16#04, 16#03,   % ecdsa_secp256r1_sha256
-        16#05, 16#03,   % ecdsa_secp384r1_sha384
-        16#06, 16#03,   % ecdsa_secp521r1_sha512
-        16#02, 16#03,   % ecdsa_sha1
-        16#08, 16#04,   % rsa_pss_rsae_sha256
-        16#08, 16#05,   % rsa_pss_rsae_sha384
-        16#08, 16#06,   % rsa_pss_rsae_sha512
-        16#04, 16#01,   % rsa_pkcs1_sha256
-        16#05, 16#01,   % rsa_pkcs1_sha384
-        16#06, 16#01,   % rsa_pkcs1_sha512
-        16#02, 16#01,   % rsa_pkcs1_sha1
-        16#04, 16#02,
-        16#03, 16#02,
-        16#02, 16#02,
-        16#03, 16#01
+        16#0403,   % ecdsa_secp256r1_sha256
+        16#0503,   % ecdsa_secp384r1_sha384
+        16#0603,   % ecdsa_secp521r1_sha512
+        16#0203,   % ecdsa_sha1
+        16#0804,   % rsa_pss_rsae_sha256
+        16#0805,   % rsa_pss_rsae_sha384
+        16#0806,   % rsa_pss_rsae_sha512
+        16#0401,   % rsa_pkcs1_sha256
+        16#0501,   % rsa_pkcs1_sha384
+        16#0601,   % rsa_pkcs1_sha512
+        16#0201,   % rsa_pkcs1_sha1
+        16#0402,
+        16#0302,
+        16#0202,
+        16#0301
     ],
-    Selected = lists:sublist(AllAlgos, Count * 2),
+    EffCount = min(Count, length(AllAlgos)),
+    Selected = lists:sublist(AllAlgos, EffCount),
     Shuffled = shuffle_list(Selected),
-    AlgoListLen = Count * 2,
+    AlgoListLen = EffCount * 2,
     ExtLen = AlgoListLen + 2,
     <<16#00, 16#0d,             % signature_algorithms
       ExtLen:?u16,               % ext length
       AlgoListLen:?u16,          % list length
-      << <<A:8>> || A <- Shuffled >>/binary>>.
+      << <<A:?u16>> || A <- Shuffled >>/binary>>.
 
 %% ============================================================================
 %% @doc Build ECH extension from profile
@@ -865,21 +884,14 @@ build_ec_point_formats(_) ->
     <<>>.
 
 %% ============================================================================
-%% @doc Build supported_groups extension
+%% @doc Build supported_groups extension.
+%% `Groups` is a list of full 16-bit named-group IDs.
 %% @end
 %% ============================================================================
 -spec build_supported_groups(map()) -> binary().
-build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    %% Interleave GREASE
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Groups, GreaseVals),
-    
+build_supported_groups(#{key_share_groups := Groups} = Profile) ->
+    GreaseVals = grease_for(Profile),
+    WithGrease = interleave_random(Groups, GreaseVals),
     GroupsBin = << <<G:?u16>> || G <- WithGrease >>,
     GroupsLen = byte_size(GroupsBin),
     <<16#00, 16#0a,              % supported_groups
@@ -893,7 +905,7 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
 %% ============================================================================
 -spec build_padding(map()) -> binary().
 build_padding(#{padding_size := {Min, Max}}) ->
-    PadSize = Min + rand:uniform(Max - Min + 1),
+    PadSize = Min + rand:uniform(Max - Min + 1) - 1,
     case PadSize of
         0 -> <<>>;
         _ ->
@@ -915,7 +927,7 @@ build_session_ticket_ext(_) ->
     <<>>.
 
 %% ============================================================================
-%% @doc Build OCSP stapling extension for ClientHello  
+%% @doc Build OCSP stapling extension for ClientHello
 %% @end
 %% ============================================================================
 -spec build_ocsp_stapling_ext(map()) -> binary().

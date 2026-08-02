@@ -349,38 +349,94 @@ match_domain(Domain, Allowed) ->
     end.
 
 %% ============================================================================
-%% @doc Generate fake OCSP response
+%% @doc Generate fake OCSP response with proper ASN.1 DER structure
+%% Based on RFC 6960 Section 4.2.1
+%% @end
 %% ============================================================================
 -spec generate_ocsp_response(binary()) -> binary().
 generate_ocsp_response(_ServerDigest) ->
     %% Generate a realistic-looking OCSP response
+    
     %% OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
     OcspStatus = 0,
+    
     %% Basic OCSP Response structure
-    ResponderId = crypto:strong_rand_bytes(20),  % SHA1 hash
+    ResponderId = crypto:strong_rand_bytes(20),  % SHA1 hash of responder key
     ProducedAt = erlang:system_time(seconds),
-    %% This update + 7 days
     ThisUpdate = ProducedAt,
-    NextUpdate = ProducedAt + 604800,
+    NextUpdate = ProducedAt + 604800,  % 7 days validity
+    
     %% Single response for our certificate
-    CertId = crypto:strong_rand_bytes(36),  % HashAlgorithm + IssuerNameHash + IssuerKeyHash + SerialNumber
+    %% CertID ::= SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+    CertId = crypto:strong_rand_bytes(36),
     CertStatus = <<0>>,  % good
-    SingleResponse = <<CertId/binary, CertStatus/binary, 
-                        (encode_generalized_time(ThisUpdate))/binary,
-                        (encode_generalized_time(NextUpdate))/binary>>,
-    Responses = <<1:32, SingleResponse/binary>>,
-    ResponseData = <<0, ResponderId/binary, 
+    
+    %% SingleResponse ::= SEQUENCE { certID, certStatus, thisUpdate, nextUpdate [0] OPTIONAL }
+    SingleResponse = <<16#30,                       % SEQUENCE tag
+                       (byte_size(CertId) + 1 + 
+                        byte_size(encode_generalized_time(ThisUpdate)) +
+                        byte_size(encode_generalized_time(NextUpdate)) + 8),  % rough size
+                       CertId/binary,
+                       CertStatus/binary,
+                       (encode_generalized_time(ThisUpdate))/binary,
+                       16#a0,                        % [0] EXPLICIT tag for nextUpdate
+                       (byte_size(encode_generalized_time(NextUpdate))),
+                       (encode_generalized_time(NextUpdate))/binary>>,
+    
+    %% ResponseData ::= SEQUENCE { version [0], responderID, producedAt, responses, responseExtensions [1] OPTIONAL }
+    Responses = <<16#30,                            % SEQUENCE of SingleResponse
+                  (byte_size(SingleResponse) + 2),
+                  1:8,                              % length short form
+                  (byte_size(SingleResponse)):8,   % one response
+                  SingleResponse/binary>>,
+    
+    ResponseData = <<16#30,                         % SEQUENCE tag for ResponseData
+                     (1 + byte_size(ResponderId) + 
+                      byte_size(encode_generalized_time(ProducedAt)) +
+                      byte_size(Responses) + 6),
+                     0:8, 0:8,                      % version DEFAULT v1
+                     ResponderId/binary,            % responderID byName or byKey
                      (encode_generalized_time(ProducedAt))/binary,
                      Responses/binary>>,
+    
+    %% Signature with fake algorithm identifier
     Signature = crypto:strong_rand_bytes(256),
-    BasicOcspResponse = <<ResponseData/binary, 1:24, Signature/binary>>,
-    <<OcspStatus, (byte_size(BasicOcspResponse)):?u24, BasicOcspResponse/binary>>.
+    SignatureAlgorithm = <<16#30, 16#0d, 16#06, 16#09, 16#2a, 16#86, 16#48,
+                           16#86, 16#f7, 16#0d, 16#01, 16#01, 16#0b,
+                           16#05, 16#00>>,  % sha256WithRSAEncryption
+    
+    BasicOcspResponse = <<ResponseData/binary,
+                          SignatureAlgorithm/binary,
+                          16#03, (byte_size(Signature)):8, 16#00,  % BIT STRING with 0 unused bits
+                          Signature/binary>>,
+    
+    %% Wrap in OCSPResponse with proper ASN.1 encoding
+    %% OCSPResponse ::= SEQUENCE {
+    %%   responseStatus         OCSPResponseStatus,
+    %%   responseBytes          [0] EXPLICIT ResponseBytes OPTIONAL }
+    
+    OcspStatusASN1 = <<16#0a, 16#01, OcspStatus>>,  % ENUMERATED
+    
+    ResponseBytesContent = <<16#30,                  % SEQUENCE for ResponseBytes
+                             (byte_size(BasicOcspResponse) + 2),
+                             16#06, 16#09,           % OID length 9
+                             16#2b, 16#06, 16#01, 16#05, 16#05, 16#07, 16#30, 16#01, 16#01,  % id-pkix-ocsp-basic
+                             BasicOcspResponse/binary>>,
+    
+    ResponseBytesTagged = <<16#a0,                   % [0] EXPLICIT tag
+                            (byte_size(ResponseBytesContent)),
+                            ResponseBytesContent/binary>>,
+    
+    OuterSeq = <<16#30,                               % SEQUENCE tag for OCSPResponse
+                 (byte_size(OcspStatusASN1) + byte_size(ResponseBytesTagged)),
+                 OcspStatusASN1/binary,
+                 ResponseBytesTagged/binary>>,
+    
+    OuterSeq.
 
 %% ============================================================================
-%% @doc Encode GeneralizedTime for OCSP.
-%%
-%% The timestamp is encoded directly as UTC. The trailing "Z" is therefore
-%% correct and must not be used with local time.
+%% @doc Encode GeneralizedTime for OCSP (DER format).
+%% Format: YYYYMMDDHHMMSSZ
 %% @end
 %% ============================================================================
 -spec encode_generalized_time(non_neg_integer()) -> binary().
@@ -393,10 +449,11 @@ encode_generalized_time(Timestamp) ->
         "~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ",
         [Y, M, D, H, Mi, S]
     ),
-    list_to_binary(Str).
+    TimeStr = list_to_binary(Str),
+    <<23, (byte_size(TimeStr)), TimeStr/binary>>.  % UTCTime tag
 
 %% ============================================================================
-%% @doc Generate Session Ticket
+%% @doc Generate Session Ticket (RFC 5077 / RFC 8446 §4.6.1)
 %% @end
 %% ============================================================================
 -spec generate_session_ticket(binary()) -> binary().
@@ -406,7 +463,11 @@ generate_session_ticket(_Secret) ->
     Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
     TicketLifetime = 604800,  % 7 days
     
-    <<TicketLifetime:32, TicketAgeAdd/binary, 
+    %% NewSessionTicket message (TLS 1.3 format)
+    <<?TLS_TAG_NEW_SESSION_TICKET,
+      (4 + 4 + 1 + byte_size(TicketNonce) + 2 + byte_size(Ticket) + 2):?u24,
+      TicketLifetime:32,
+      TicketAgeAdd/binary,
       (byte_size(TicketNonce)):8, TicketNonce/binary,
       (byte_size(Ticket)):?u16, Ticket/binary,
       0:?u16>>.  % No extensions

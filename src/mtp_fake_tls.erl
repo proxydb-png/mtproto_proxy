@@ -6,7 +6,9 @@
 %%% It's not real TLS, but it looks like TLS1.3 from outside
 %%% Enhanced with deep fingerprint randomization for maximum evasion
 %%% Added Session Ticket and OCSP stapling support
+%%% Added CompressCertificate extension support (RFC 8879)
 %%% Fixed Telegram X response hash mismatch compatibilities
+%%% Fixed OCSP response ASN.1 DER encoding (RFC 6960)
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -38,7 +40,8 @@
 -record(st, {
     session_ticket :: binary() | undefined,
     ocsp_response :: binary() | undefined,
-    session_ticket_lifetime :: non_neg_integer() | undefined
+    session_ticket_lifetime :: non_neg_integer() | undefined,
+    compress_cert_algorithm :: brotli | undefined
 }).
 
 -record(client_hello,
@@ -473,8 +476,40 @@ generate_session_ticket(_Secret) ->
       0:?u16>>.  % No extensions
 
 %% ============================================================================
+%% @doc Generate fake compressed certificate message
+%% Based on RFC 8879 CompressCertificate extension
+%% @end
+%% ============================================================================
+-spec generate_compressed_certificate(atom()) -> binary().
+generate_compressed_certificate(brotli) ->
+    %% CompressedCertificate message
+    %% struct {
+    %%     Algorithm algorithm;
+    %%     uint24 uncompressed_length;
+    %%     opaque compressed_certificate_message<1..2^24-1>;
+    %% } CompressedCertificate;
+    
+    %% Generate fake uncompressed certificate (realistic size: 1500-4000 bytes)
+    UncompressedSize = 1500 + rand:uniform(2500),
+    UncompressedCert = crypto:strong_rand_bytes(UncompressedSize),
+    
+    %% Fake Brotli compression (just use random bytes as "compressed")
+    CompressedSize = (UncompressedSize * 30) div 100 + rand:uniform(100),  % ~30% of original
+    CompressedCert = crypto:strong_rand_bytes(CompressedSize),
+    
+    %% Build CompressedCertificate message
+    Payload = <<2:?u16,                     % algorithm: brotli (2)
+               UncompressedSize:?u24,       % uncompressed_length
+               CompressedSize:?u24,         % compressed length (3-byte)
+               CompressedCert/binary>>,      % compressed data
+    
+    Payload;
+generate_compressed_certificate(_) ->
+    undefined.
+
+%% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Enhanced with Session Ticket and OCSP support
+%% Enhanced with Session Ticket, OCSP and CompressCertificate support
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
@@ -508,12 +543,13 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             end
     end,
 
-    %% Check if client supports session ticket and OCSP
+    %% Check client capabilities
     HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
     HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
+    HasCompressCert = lists:keymember(16#001b, 1, Extensions),  % compress_certificate
     
-    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p", 
-               [HasSessionTicket, HasOcspStapling]),
+    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p, CompressCert: ~p", 
+               [HasSessionTicket, HasOcspStapling, HasCompressCert]),
 
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
@@ -521,8 +557,23 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
         error({protocol_error, tls_invalid_digest, XoredDigest}),
     KeyShare = make_key_share(Extensions),
+    
+    %% Determine compress_certificate algorithm from ClientHello
+    CompCertAlgo = case HasCompressCert of
+        true ->
+            case lists:keyfind(16#001b, 1, Extensions) of
+                {_, <<_AlgoCount, Algos/binary>>} ->
+                    case binary:match(Algos, <<2>>) of
+                        {_, _} -> brotli;      % Brotli supported
+                        nomatch -> undefined
+                    end;
+                _ -> undefined
+            end;
+        false -> undefined
+    end,
+    
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare, 
-                               HasSessionTicket, HasOcspStapling),
+                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
     %% Generate Session Ticket if client supports it
@@ -543,21 +594,32 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             undefined
     end,
     
+    %% Generate CompressedCertificate if supported
+    CompCertRecord = case CompCertAlgo of
+        brotli ->
+            CompCertMsg = generate_compressed_certificate(brotli),
+            as_tls_frame(?TLS_REC_HANDSHAKE, CompCertMsg);
+        _ ->
+            <<>>
+    end,
+    
     %% Build initial response without proper digest
-    Response0 = [_, CC, DD, ST] =
+    Response0 = [_, CC, DD, ST, CP] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
          as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-         TicketRecord],
+         TicketRecord,
+         CompCertRecord],
     
     %% Calculate digest with complete response
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
-                              HasSessionTicket, HasOcspStapling),
+                              HasSessionTicket, HasOcspStapling, CompCertAlgo),
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
                 DD,
-                ST],
+                ST,
+                CP],
     
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
@@ -571,7 +633,8 @@ from_client_hello(Data, Secret, AllowedDomains) ->
              session_ticket_lifetime = case HasSessionTicket of
                                           true -> 604800;
                                           false -> undefined
-                                      end},
+                                      end,
+             compress_cert_algorithm = CompCertAlgo},
     {ok, Response, Meta, St}.
 
 %% ============================================================================
@@ -694,7 +757,7 @@ make_key_share(Exts) ->
     end.
 
 make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, 
-               HasSessionTicket, HasOcspStapling) ->
+               HasSessionTicket, HasOcspStapling, CompCertAlgo) ->
     KeyShareEntity = <<KeyShareGroup:?u16, (byte_size(KeyShareKey)):?u16, KeyShareKey/binary>>,
     
     ExtensionsBase = [
@@ -711,11 +774,20 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
     end,
     
     %% Add OCSP stapling extension if client supports it
-    ExtensionsFinal = case HasOcspStapling of
+    ExtensionsWithOCSP = case HasOcspStapling of
         true ->
             ExtensionsWithTicket ++ [<<?EXT_STATUS_REQUEST:?u16, 0:?u16>>];
         false ->
             ExtensionsWithTicket
+    end,
+    
+    %% Add CompressCertificate extension if client supports it
+    ExtensionsFinal = case CompCertAlgo of
+        brotli ->
+            %% Only advertise Brotli support
+            ExtensionsWithOCSP ++ [<<16#00, 16#1b, 16#00, 16#03, 16#02, 16#02, 16#00>>];
+        _ ->
+            ExtensionsWithOCSP
     end,
     
     SessionSize = byte_size(SessionId),
@@ -919,7 +991,7 @@ build_alpn(_) ->
     <<>>.
 
 %% ============================================================================
-%% @doc Build compress_certificate extension
+%% @doc Build compress_certificate extension for ClientHello
 %% @end
 %% ============================================================================
 -spec build_compress_certificate(map()) -> binary().
@@ -1024,7 +1096,7 @@ make_sni(Domains) ->
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
 %% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with random fingerprint and Session Ticket/OCSP support.
+%% @doc Generate Fake-TLS "ClientHello" with random fingerprint and full extension support.
 %% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
@@ -1106,7 +1178,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
         KeyShare,
         <<16#00, 16#12, 0:16>>,                       % signed_certificate_timestamp
         SupportedGroups,
-        CompCertExt,
+        CompCertExt,                                   % compress_certificate
         RenegExt,                                     % dynamic renegotiation_info
         SigAlgos,
         OcspStaplingExt,                               % OCSP Stapling
@@ -1149,7 +1221,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
 
 %% ============================================================================
 %% @doc Parses "ServerHello" (the one produced by from_client_hello/2).
-%% Updated to handle Session Ticket and OCSP responses
+%% Updated to handle Session Ticket, OCSP and CompressedCertificate
 %% ============================================================================
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
@@ -1162,6 +1234,14 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
                      Tail/binary>>) ->
     %% ServerHello with Session Ticket
+    {Handshake, ChangeCipher, Data, Tail};
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
+                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
+                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, CompCertLen:?u16, _CompCert:CompCertLen/binary,
+                     Tail/binary>>) ->
+    %% ServerHello with Session Ticket and CompressedCertificate
     {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;

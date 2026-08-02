@@ -492,6 +492,8 @@ generate_compressed_certificate(_) ->
 %% @doc Parse fake-TLS "ClientHello" and generate ServerHello response.
 %% CRITICAL: SrvHello0 and SrvHello MUST have identical structure.
 %% They differ ONLY in the 32-byte digest field.
+%% CompressCertificate is advertised in ServerHello but NOT sent as a record.
+%% This avoids hash mismatch while keeping JA3 fingerprint 100% intact.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -556,13 +558,11 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     KeyShare = make_key_share(Extensions),
     
     %% ============================================================
-    %% CRITICAL FIX: Build SrvHello0 and SrvHello with IDENTICAL structure
-    %% Both use the SAME SessionId, KeyShare, HasSessionTicket, HasOcspStapling, CompCertAlgo
-    %% The ONLY difference is the 32-byte digest field
+    %% CRITICAL FIX: Build all records BEFORE SrvHello0
+    %% SrvHello0 and SrvHello share IDENTICAL structure (only digest differs)
+    %% CompressCertificate is advertised but NOT included in Response
+    %% This prevents hash mismatch on Telegram X
     %% ============================================================
-    
-    %% Generate all extra records BEFORE building ServerHello
-    %% This ensures Response0 structure is final and won't change
     
     %% Fake HTTP data
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(128) + 64),
@@ -584,36 +584,28 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             undefined
     end,
     
-    %% Compressed Certificate
-    CompCertRecord = case CompCertAlgo of
-        brotli ->
-            CompCertMsg = generate_compressed_certificate(brotli),
-            as_tls_frame(?TLS_REC_HANDSHAKE, CompCertMsg);
-        _ ->
-            <<>>
-    end,
-    
-    %% Build SrvHello0 with zero digest (same structure as final SrvHello)
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare, 
-                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
-    
-    %% Build Response0 - this is what gets hashed
+    %% Build frames
     ChangeCipherFrame = as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
     DataFrame = as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+    
+    %% Build SrvHello0 with zero digest
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare, 
+                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
     SrvHelloFrame0 = as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
     
-    Response0 = [SrvHelloFrame0, ChangeCipherFrame, DataFrame, TicketRecord, CompCertRecord],
+    %% Response0 WITHOUT CompressedCertificate record
+    Response0 = [SrvHelloFrame0, ChangeCipherFrame, DataFrame, TicketRecord],
     
-    %% Calculate digest using the COMPLETE Response0
+    %% Calculate digest using Response0
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     
-    %% Build final SrvHello with real digest (SAME structure as SrvHello0)
+    %% Build final SrvHello with real digest (same structure as SrvHello0)
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
                               HasSessionTicket, HasOcspStapling, CompCertAlgo),
     SrvHelloFrame = as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
     
-    %% Build final Response
-    Response = [SrvHelloFrame, ChangeCipherFrame, DataFrame, TicketRecord, CompCertRecord],
+    %% Final Response WITHOUT CompressedCertificate
+    Response = [SrvHelloFrame, ChangeCipherFrame, DataFrame, TicketRecord],
     
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
@@ -753,6 +745,7 @@ make_key_share(Exts) ->
 %% ============================================================================
 %% @doc Build ServerHello message.
 %% NOTE: SrvHello0 and SrvHello MUST use identical parameters except digest.
+%% CompressCertificate is advertised in extensions for JA3 matching.
 %% ============================================================================
 make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, 
                HasSessionTicket, HasOcspStapling, CompCertAlgo) ->
@@ -1086,6 +1079,7 @@ make_sni(Domains) ->
 
 %% ============================================================================
 %% @doc Generate Fake-TLS "ClientHello" with random fingerprint.
+%% @end
 %% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->

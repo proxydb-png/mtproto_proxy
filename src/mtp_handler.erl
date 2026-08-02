@@ -24,12 +24,11 @@
 
 -include_lib("kernel/include/logger.hrl").
 
--define(MAX_SOCK_BUF_SIZE, 1024 * 50).    % Decrease if CPU is cheaper than RAM
--define(MAX_UP_INIT_BUF_SIZE, 1024 * 1024).     %1mb
+-define(MAX_SOCK_BUF_SIZE, 1024 * 50).
+-define(MAX_UP_INIT_BUF_SIZE, 1024 * 1024).
 -define(DEFAULT_UPSTREAM_SEND_TIMEOUT_MS, 15000).
 
 -define(HEALTH_CHECK_INTERVAL, 5000).
-% telegram server responds with "l\xfe\xff\xff" if client packet MTProto is invalid
 -define(SRV_ERROR, <<108, 254, 255, 255>>).
 -define(TLS_START, 22, 3, 1).
 -define(TLS_CLIENT_HELLO_MIN_LEN, 512).
@@ -50,7 +49,7 @@
          dc_id :: {DcId :: integer(), Pool :: pid()} | undefined,
 
          ad_tag :: binary(),
-         addr :: mtp_config:netloc_v4v6(),           % IP/Port of remote side
+         addr :: mtp_config:netloc_v4v6(),
          policy_state :: any(),
          started_at :: pos_integer(),
          timer_state = init :: init | hibernate | stop,
@@ -69,7 +68,6 @@
 start_link(Ref, Transport, Opts) ->
     {ok, proc_lib:spawn_link(?MODULE, ranch_init, [{Ref, Transport, Opts}])}.
 
-%% Ranch 1.x compatibility shim (socket is obtained via ranch:handshake/1 in 2.x)
 start_link(Ref, _Socket, Transport, Opts) ->
     start_link(Ref, Transport, Opts).
 
@@ -81,14 +79,12 @@ keys_str() ->
 send(Upstream, Packet) ->
     gen_server:cast(Upstream, Packet).
 
-%% See doc/migration-flow.md
 -spec migrate(pid(), OldDown :: mtp_down_conn:handle()) -> ok.
 migrate(Upstream, OldDown) ->
     gen_server:cast(Upstream, {migrate, OldDown}).
 
 %% Callbacks
 
-%% Custom gen_server init
 ranch_init({Ref, Transport, Opts}) ->
     {ok, Socket} = ranch:handshake(Ref),
     case init({Socket, Transport, Opts}) of
@@ -135,17 +131,12 @@ handle_call(_Request, _From, State) ->
     {reply, Reply, State}.
 
 handle_cast({proxy_ans, Down, Data}, #state{down = Down, srv_error_filter = off} = S) ->
-    %% telegram server -> proxy
-    %% srv_error_filter is 'off'
     {ok, S1} = up_send(Data, S),
     ok = mtp_down_conn:ack(Down, 1, iolist_size(Data)),
     maybe_check_health(bump_timer(S1));
 handle_cast({proxy_ans, Down, ?SRV_ERROR = Data},
             #state{down = Down, srv_error_filter = Filter, listener = Listener,
                    addr = {Ip, _}} = S) when Filter =/= off ->
-    %% telegram server -> proxy
-    %% Server replied with server error; it might be another kind of replay attack;
-    %% Don't send this packet to client so proxy won't be fingerprinted
     ok = mtp_down_conn:ack(Down, 1, iolist_size(Data)),
     ?LOG_WARNING("~s: protocol_error srv_error_filtered", [inet:ntoa(Ip)]),
     mtp_metric:count_inc([?APP, protocol_error, total], 1, #{labels => [Listener, srv_error_filtered]}),
@@ -155,9 +146,6 @@ handle_cast({proxy_ans, Down, ?SRV_ERROR = Data},
          on -> S
      end};
 handle_cast({proxy_ans, Down, Data}, #state{down = Down, srv_error_filter = Filter} = S) when Filter =/= off ->
-    %% telegram server -> proxy
-    %% Normal data packet
-    %% srv_error_filter is 'on' or srv_error_filter is 'first' and it's 1st server packet
     {ok, S1} = up_send(Data, S),
     ok = mtp_down_conn:ack(Down, 1, iolist_size(Data)),
     S2 = case Filter of
@@ -188,7 +176,6 @@ handle_cast({migrate, OldDown}, #state{down = OldDown, dc_id = {DcId, Pool},
             {noreply, S#state{down = NewDown}}
     end;
 handle_cast({migrate, _StaleDown}, S) ->
-    %% Stale migrate from a previous down_conn — already migrated, ignore.
     {noreply, S};
 handle_cast({simple_ack, Down, Confirm}, #state{down = Down} = S) ->
     ?LOG_INFO("Simple ack: ~p, ~p", [Down, Confirm]),
@@ -200,13 +187,9 @@ handle_cast(Other, State) ->
 handle_info({tcp, Sock, Data}, #state{sock = Sock, stage = Stage, transport = Transport,
                                       listener = Listener, addr = {Ip, _}} = S)
   when Stage =/= fronting ->
-    %% client -> proxy (tunnel / handshake stages)
     Size = byte_size(Data),
     mtp_metric:count_inc([?APP, received, upstream, bytes], Size, #{labels => [Listener]}),
     mtp_metric:histogram_observe([?APP, tracker_packet_size, bytes], Size, #{labels => [upstream]}),
-    %% Accumulate raw bytes before processing so that attempt_fronting has the full buffer
-    %% even when the ClientHello or TLS Application Data arrived in multiple fragments.
-    %% Skipped for tunnel stage (hot path) since fronting can never trigger there.
     S1 = case Stage of
              tunnel -> S;
              _ -> S#state{hello_acc = <<(S#state.hello_acc)/binary, Data/binary>>}
@@ -214,7 +197,6 @@ handle_info({tcp, Sock, Data}, #state{sock = Sock, stage = Stage, transport = Tr
     try handle_upstream_data(Data, S1) of
         {ok, S2} ->
             ok = Transport:setopts(Sock, [{active, once}]),
-            %% Consider checking health here as well
             {noreply, bump_timer(S2)}
     catch error:{protocol_error, Type, Extra} ->
             mtp_metric:count_inc([?APP, protocol_error, total], 1, #{labels => [Listener, Type]}),
@@ -226,13 +208,11 @@ handle_info({tcp, Sock, Data}, #state{sock = Sock, stage = Stage, transport = Tr
                     {stop, normal, maybe_close_down(S)}
             end
     end;
-%% fronting stage: data from client -> relay to front
 handle_info({tcp, Sock, Data}, #state{sock = Sock, stage = fronting,
                                       front_sock = FrontSock, transport = Transport} = S) ->
     ok = gen_tcp:send(FrontSock, Data),
     ok = Transport:setopts(Sock, [{active, once}]),
     {noreply, bump_timer(S)};
-%% fronting stage: data from front -> relay to client
 handle_info({tcp, FrontSock, Data}, #state{front_sock = FrontSock, stage = fronting,
                                            sock = Sock, transport = Transport} = S) ->
     ok = Transport:send(Sock, Data),
@@ -282,7 +262,6 @@ terminate(_Reason, #state{started_at = Started, listener = Listener,
                     ?LOG_WARNING("Failed to decrement policy: ~p:~p", [T, R])
             end;
         _ ->
-            %% Failed before policy was stored in state. Eg, because of "policy_error"
             ok
     end,
     maybe_close_down(S),
@@ -337,7 +316,6 @@ state_timeout(stop) ->
 
 %% Stream handlers
 
-%% Handle telegram client -> proxy stream
 handle_upstream_data(Bin, #state{stage = tunnel,
                                   codec = UpCodec} = S) ->
     {ok, S3, UpCodec1} =
@@ -369,10 +347,7 @@ parse_upstream_data(<<?TLS_START, _/binary>> = AllData,
                      #state{stage = tls_hello, secret = Secret, codec = Codec0,
                             addr = {Ip, _}, listener = Listener} = S) when
       byte_size(AllData) >= 5 ->
-    %% TLS record format: Type(1) + Version(2) + Length(2) + Payload(Length)
-    %% We need at least 5 bytes to read the header
     <<?TLS_START, TlsPacketLen:16/unsigned-big, _/binary>> = AllData,
-    %% Validate minimum length
     (TlsPacketLen >= ?TLS_CLIENT_HELLO_MIN_LEN) orelse
         error({protocol_error, tls_client_hello_too_short, TlsPacketLen}),
     FullPacketSize = 5 + TlsPacketLen,
@@ -381,22 +356,13 @@ parse_upstream_data(<<?TLS_START, _/binary>> = AllData,
             assert_protocol(mtp_fake_tls),
             <<Data:FullPacketSize/binary, Tail/binary>> = AllData,
             EffSecret = effective_secret(Data, Secret),
-            
-            %% ============================================================
-            %% NEW: Read allowed TLS domains from config
-            %% ============================================================
             AllowedTlsDomains = application:get_env(?APP, allowed_tls_domains, []),
             
-            %% ============================================================
-            %% NEW: Call from_client_hello with domain restriction
-            %% ============================================================
             {ok, Response, Meta, TlsCodec} = 
                 case AllowedTlsDomains of
                     [] ->
-                        %% No restriction - backward compatible
                         mtp_fake_tls:from_client_hello(Data, EffSecret);
                     _ ->
-                        %% Domain restriction enabled
                         mtp_fake_tls:from_client_hello(Data, EffSecret, AllowedTlsDomains)
                 end,
             
@@ -404,12 +370,23 @@ parse_upstream_data(<<?TLS_START, _/binary>> = AllData,
             check_tls_policy(Listener, Ip, Meta),
             Codec1 = mtp_codec:replace(tls, true, TlsCodec, Codec0),
             Codec = mtp_codec:push_back(tls, Tail, Codec1),
-            ok = up_send_raw(Response, S),        %FIXME: if this send fail, we will get counter policy leak
+            ok = up_send_raw(Response, S),
+            
+            %% ============================================================
+            %% Send post-CCS records (Flight 2) for DPI evasion
+            %% ============================================================
+            PostCcsRecords = mtp_fake_tls:get_post_ccs_records(TlsCodec),
+            case iolist_size(PostCcsRecords) > 0 of
+                true ->
+                    ok = up_send_raw(PostCcsRecords, S),
+                    ?LOG_DEBUG("Sent post-CCS records: ~p bytes", [iolist_size(PostCcsRecords)]);
+                false ->
+                    ok
+            end,
+            
             {ok, S#state{codec = Codec, stage = init, secret = EffSecret,
                          policy_state = {ok, maps:get(sni_domain, Meta, undefined)}}};
         false ->
-            %% Received only part of the ClientHello — push it back into the codec
-            %% buffer so the next TCP fragment is reassembled with it before we try again.
             Codec1 = mtp_codec:push_back(first, AllData, Codec0),
             {incomplete, S#state{codec = Codec1, stage = tls_hello}}
     end;
@@ -421,8 +398,6 @@ parse_upstream_data(<<Header:64/binary, Rest/binary>>,
                             sock = Sock, transport = Transport} = S) ->
     {TlsHandshakeDone, _} = mtp_codec:info(tls, Codec0),
     AllowedProtocols = allowed_protocols(),
-    %% If the only enabled protocol is fake-tls and tls handshake haven't been performed yet - raise
-    %% protocol error.
     (is_tls_only(AllowedProtocols) andalso not TlsHandshakeDone) andalso
         error({protocol_error, tls_client_hello_expected, Header}),
     case mtp_obfuscated:from_header(Header, Secret) of
@@ -430,13 +405,11 @@ parse_upstream_data(<<Header:64/binary, Rest/binary>>,
             {ProtoToReport, PState} =
                 case TlsHandshakeDone of
                     true when PacketLayerMod == mtp_secure ->
-                        %% Replay was already checked at the ClientHello stage; skip here.
                         {mtp_secure_fake_tls, PState0};
                     false ->
                         maybe_check_replay(Header),
                         assert_protocol(PacketLayerMod, AllowedProtocols),
                         check_policy(Listener, Ip, undefined),
-                        %FIXME: if any codebelow fail, we will get counter policy leak
                         {PacketLayerMod, {ok, undefined}}
                 end,
             mtp_metric:count_inc([?APP, protocol_ok, total],
@@ -489,7 +462,6 @@ assert_protocol(Protocol, AllowedProtocols) ->
         orelse error({protocol_error, disabled_protocol, Protocol}).
 
 maybe_check_replay(Packet) ->
-    %% Check for session replay attack: attempt to connect with the same 1st 64byte packet
     case application:get_env(?APP, replay_check_session_storage, off) of
         on ->
             (new == mtp_session_storage:check_add(Packet)) orelse
@@ -499,7 +471,6 @@ maybe_check_replay(Packet) ->
     end.
 
 check_tls_policy(Listener, Ip, #{sni_domain := TlsDomain}) ->
-    %% TODO validate timestamp!
     check_policy(Listener, Ip, TlsDomain);
 check_tls_policy(_, Ip, Meta) ->
     error({protocol_error, tls_no_sni, {Ip, Meta}}).
@@ -512,8 +483,6 @@ check_policy(Listener, Ip, Domain) ->
             error({protocol_error, policy_error, {Rule, Listener, Ip, Domain}})
     end.
 
-%% Like check_policy/3 but skips max_connections rules — fronted connections do not consume
-%% Telegram resources and must not count against connection limits.
 check_front_policy(Listener, Ip, Domain) ->
     AllRules = application:get_env(?APP, policy, []),
     Rules = [R || R <- AllRules, element(1, R) =/= max_connections],
@@ -523,9 +492,6 @@ check_front_policy(Listener, Ip, Domain) ->
             error({protocol_error, policy_error, {Rule, Listener, Ip, Domain}})
     end.
 
-%% Attempt to initiate domain fronting for the given protocol error type.
-%% Returns {ok, NewState} if fronting was initiated, skip otherwise.
-%% State#state.hello_acc contains the full raw byte stream accumulated so far.
 attempt_fronting(tls_invalid_digest, _Extra,
                  #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S) ->
     case application:get_env(?APP, domain_fronting, off) of
@@ -539,9 +505,6 @@ attempt_fronting(tls_invalid_digest, _Extra,
                     skip
             end
     end;
-%% ============================================================
-%% NEW: Handle tls_domain_not_allowed error
-%% ============================================================
 attempt_fronting(tls_domain_not_allowed, Domain,
                  #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S) ->
     ?LOG_WARNING("Client tried to connect with unauthorized domain: ~s", [Domain]),
@@ -553,9 +516,6 @@ attempt_fronting(tls_domain_not_allowed, Domain,
 attempt_fronting(replay_session_detected, SniDomain,
                  #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S)
   when is_binary(SniDomain) ->
-    %% Replay detected at ClientHello level (before ServerHello was sent).
-    %% hello_acc = raw ClientHello bytes → forward to fronting host which responds with
-    %% a real ServerHello — transparent forward, no TLS breakage.
     case application:get_env(?APP, domain_fronting, off) of
         off -> skip;
         Config ->
@@ -582,9 +542,6 @@ maybe_check_replay_tls(#{client_digest := Digest} = Meta) ->
             ok
     end.
 
-%% Select the secret to use for fake-TLS ClientHello validation.
-%% When per_sni_secrets=on, derive a domain-specific 16-byte secret so that each
-%% SNI domain gets a unique token — users cannot recover the base secret from their link.
 effective_secret(Data, Secret) ->
     case application:get_env(?APP, per_sni_secrets, off) of
         off ->
@@ -596,7 +553,6 @@ effective_secret(Data, Secret) ->
                 {ok, Sni} ->
                     mtp_fake_tls:derive_sni_secret(Secret, Sni, Salt);
                 {error, Reason} ->
-                    %% No SNI — not a valid fake-TLS MTP connection; fail fast.
                     error({protocol_error, tls_bad_client_hello, Reason})
             end
     end.
@@ -631,7 +587,6 @@ fronting_target(HostPort, _SniDomain) when is_list(HostPort) ->
     end.
 
 up_send(Packet, #state{stage = tunnel, codec = UpCodec} = S) ->
-    %% ?LOG_DEBUG(">Up: ~p", [Packet]),
     {Encoded, UpCodec1} = mtp_codec:encode_packet(Packet, UpCodec),
     ok = up_send_raw(Encoded, S),
     {ok, S#state{codec = UpCodec1}}.
@@ -658,15 +613,12 @@ up_send_raw(Data, #state{sock = Sock,
               end, #{labels => [Listener]}).
 
 down_send(Packet, #state{down = Down, listener = Listener, dc_id = Dc} = S) ->
-    %% ?LOG_DEBUG(">Down: ~p", [Packet]),
     case mtp_down_conn:send(Down, Packet) of
         ok ->
             {ok, S};
         {error, unknown_upstream} ->
             handle_unknown_upstream(S);
         {error, migrating} ->
-            %% DC connection is closing; this packet was never sent to TG.
-            %% Stop the handler so the client reconnects and resends.
             {DcId, _} = Dc,
             mtp_metric:count_inc([?APP, downstream_migration, total], 1,
                                  #{labels => [Listener, DcId, mid_send]}),
@@ -674,8 +626,7 @@ down_send(Packet, #state{down = Down, listener = Listener, dc_id = Dc} = S) ->
     end.
 
 handle_unknown_upstream(#state{down = Down, sock = USock, transport = UTrans} = S) ->
-    %% there might be a race-condition between packets from upstream socket and
-    %% downstream's 'close_ext' message. Most likely because of slow up_send    ok = UTrans:close(USock),
+    ok = UTrans:close(USock),
     receive
         {'$gen_cast', {close_ext, Down}} ->
             ?LOG_DEBUG("asked to close connection by downstream"),
@@ -688,7 +639,6 @@ handle_unknown_upstream(#state{down = Down, sock = USock, transport = UTrans} = 
 %% Internal
 
 
-%% @doc Terminate if message queue is too big
 maybe_check_health(#state{last_queue_check = LastCheck} = S) ->
     NowMs = erlang:system_time(millisecond),
     Delta = NowMs - LastCheck,
@@ -704,11 +654,7 @@ maybe_check_health(#state{last_queue_check = LastCheck} = S) ->
             end
     end.
 
-%% 1. If proc queue > qlen - stop
-%% 2. If proc total memory > gc - do GC and go to 3
-%% 3. If proc total memory > total_mem - stop
 check_health() ->
-    %% see .app.src
     Defaults = [{qlen, 300},
                 {gc, 409600},
                 {total_mem, 3145728}],
@@ -721,8 +667,6 @@ do_check_health([{qlen, Limit} | _], #{message_queue_len := QLen} = Health) when
     ?LOG_WARNING("Upstream too large queue_len=~w, health=~p", [QLen, Health]),
     overflow;
 do_check_health([{gc, Limit} | Other], #{total_mem := TotalMem}) when TotalMem > Limit ->
-    %% Maybe it doesn't makes sense to do GC if queue len is more than, eg, 50?
-    %% In this case almost all memory will be in msg queue
     mtp_metric:count_inc([?APP, healthcheck, total], 1,
                          #{labels => [force_gc]}),
     erlang:garbage_collect(self()),
@@ -768,8 +712,6 @@ accepted_socket_opts() ->
                      [{linger, {true, 0}}]
              end,
     [{active, once},
-     %% {recbuf, ?MAX_SOCK_BUF_SIZE},
-     %% {sndbuf, ?MAX_SOCK_BUF_SIZE},
      {buffer, BufSize},
      {send_timeout, SendTimeout},
      {send_timeout_close, true}

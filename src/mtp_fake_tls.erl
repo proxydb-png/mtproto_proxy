@@ -3,7 +3,7 @@
 %%% Maximum-evasion Fake TLS codec with advanced DPI bypass techniques
 %%% Complete version with all helper functions
 %%% @end
--module(mtp_fake_tls_max_evasion).
+-module(mtp_fake_tls).
 
 -behaviour(mtp_codec).
 
@@ -448,13 +448,10 @@ generate_ocsp_response(_ServerDigest) ->
     NextUpdate = ProducedAt + 604800 + rand:uniform(86400),
     CertId = crypto:strong_rand_bytes(36),
     CertStatus = <<0>>,
-    SingleResponse = <<CertId/binary, CertStatus/binary,
-                       (encode_generalized_time(ThisUpdate))/binary,
-                       (encode_generalized_time(NextUpdate))/binary>>,
     ResponseCount = rand:uniform(3),
     Responses = <<ResponseCount:32,
                   (iolist_to_binary(
-                    [<<CertId:36/binary, 0,
+                    [<<CertId:36/binary, CertStatus/binary,
                       (encode_generalized_time(ThisUpdate))/binary,
                       (encode_generalized_time(NextUpdate))/binary>>
                      || _ <- lists:seq(1, ResponseCount)]))/binary>>,

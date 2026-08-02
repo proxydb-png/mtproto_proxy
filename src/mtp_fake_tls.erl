@@ -2,10 +2,8 @@
 %%% @doc Enhanced Fake TLS with DPI evasion for Iran filtering systems
 %%% Key enhancements:
 %%% - Randomized record interleaving
-%%% - Multiple compression methods
 %%% - Smart padding with realistic distributions
 %%% - Configurable jitter
-%%% - Domain fronting support
 %%% - Variable record size limits
 %%% @end
 -module(mtp_fake_tls).
@@ -931,9 +929,10 @@ decode_all(Bin, Acc, St0) ->
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
 encode_packet(Bin, St) ->
     %% Apply jitter if configured
-    case St#st.jitter_max > 0 of
+    #st{jitter_min = JMin, jitter_max = JMax} = St,
+    case JMax > 0 of
         true ->
-            Jitter = St#st.jitter_min + rand:uniform(St#st.jitter_max - St#st.jitter_min + 1),
+            Jitter = JMin + rand:uniform(JMax - JMin + 1),
             receive after Jitter -> ok end;
         false ->
             ok
@@ -942,24 +941,26 @@ encode_packet(Bin, St) ->
     {Encoded, St}.
 
 -spec encode_as_frames(binary(), codec()) -> iodata().
-encode_as_frames(Bin, #st{record_size_limit = Limit, padding_enabled = true} = St) 
-  when byte_size(Bin) =< Limit ->
-    %% Apply smart padding for small packets
-    PaddedBin = apply_smart_padding(Bin),
-    Frame = as_tls_data_frame(PaddedBin),
-    case St#st.interleave_enabled of
-        true -> interleave_with_dummy(Frame);
-        false -> Frame
-    end;
-encode_as_frames(Bin, #st{record_size_limit = Limit} = St) 
-  when byte_size(Bin) =< Limit ->
-    Frame = as_tls_data_frame(Bin),
-    case St#st.interleave_enabled of
-        true -> interleave_with_dummy(Frame);
-        false -> Frame
-    end;
-encode_as_frames(<<Chunk:Limit/binary, Tail/binary>>, St) ->
-    [encode_as_frames(Chunk, St) | encode_as_frames(Tail, St)].
+encode_as_frames(Bin, St) ->
+    #st{record_size_limit = Limit, padding_enabled = PaddingEnabled, 
+         interleave_enabled = InterleaveEnabled} = St,
+    case byte_size(Bin) =< Limit of
+        true ->
+            %% Single frame
+            PaddedBin = case PaddingEnabled of
+                true -> apply_smart_padding(Bin);
+                false -> Bin
+            end,
+            Frame = as_tls_data_frame(PaddedBin),
+            case InterleaveEnabled of
+                true -> interleave_with_dummy(Frame);
+                false -> Frame
+            end;
+        false ->
+            %% Multiple frames
+            <<Chunk:Limit/binary, Tail/binary>> = Bin,
+            [encode_as_frames(Chunk, St) | encode_as_frames(Tail, St)]
+    end.
 
 %% Smart padding to realistic sizes
 -spec apply_smart_padding(binary()) -> binary().

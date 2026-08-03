@@ -79,35 +79,13 @@
 -define(TLS_FINGERPRINT_PROFILES, [
     #{name => chrome_120,
       cipher_suites => [16#1301, 16#1302, 16#1303, 16#c02b, 16#c02f, 16#c02c, 16#c030, 16#cca9, 16#cca8, 16#c013, 16#c014, 16#009c, 16#009d, 16#002f, 16#0035],
-      cipher_order_randomized => true,
-      grease_count => {2, 4},
       key_share_groups => [16#11ec, 16#001d, 16#0017, 16#0018],
-      supported_versions => [16#0304, 16#0303],
-      version_order_randomized => true,
-      sig_algorithms_count => 15,
-      ec_point_formats => true,
-      compress_certificate => brotli,
-      ech_payload_size => [176, 208, 240],
-      session_id_length => {32, 32},
-      extensions_order_randomized => true,
-      alpn_protocols => [[<<"h2">>, <<"http/1.1">>], [<<"h2">>], [<<"http/1.1">>]],
-      padding_size => {0, 512}
+      supported_versions => [16#0304, 16#0303]
     },
     #{name => firefox_121,
       cipher_suites => [16#1301, 16#1302, 16#1303, 16#c02b, 16#c02f, 16#c02c, 16#c030, 16#cca9, 16#cca8, 16#c013, 16#c014, 16#009c, 16#009d, 16#002f, 16#0035, 16#003c, 16#003d],
-      cipher_order_randomized => true,
-      grease_count => {2, 3},
       key_share_groups => [16#001d, 16#0017],
-      supported_versions => [16#0304, 16#0303],
-      version_order_randomized => false,
-      sig_algorithms_count => 17,
-      ec_point_formats => true,
-      compress_certificate => brotli,
-      ech_payload_size => [144, 176],
-      session_id_length => {32, 32},
-      extensions_order_randomized => false,
-      alpn_protocols => [[<<"h2">>, <<"http/1.1">>]],
-      padding_size => {0, 256}
+      supported_versions => [16#0304, 16#0303]
     }
 ]).
 
@@ -117,6 +95,8 @@
                   timestamp := non_neg_integer(),
                   client_digest := binary(),
                   sni_domain => binary()}.
+
+-compile({inline, [urlencode_digit/1, match_domain/2, is_valid_group/1, as_tls_frame/2]}).
 
 %% ============================================================================
 %% API Functions
@@ -136,18 +116,15 @@ format_secret_base64(HexSecret, Domain) when byte_size(HexSecret) == 32 ->
 base64url(Bin) ->
     << << (urlencode_digit(D)) >> || <<D>> <= base64:encode(Bin), D =/= $= >>.
 
--compile({inline, [urlencode_digit/1]}).
 urlencode_digit($/) -> $_;
 urlencode_digit($+) -> $-;
 urlencode_digit(D)  -> D.
 
-%% Fast Pattern Matching Domain Check
 -spec is_domain_allowed(binary(), [binary()]) -> boolean().
 is_domain_allowed(_Domain, []) -> true;
 is_domain_allowed(Domain, AllowedDomains) ->
     lists:any(fun(Allowed) -> match_domain(Domain, Allowed) end, AllowedDomains).
 
--compile({inline, [match_domain/2]}).
 match_domain(Domain, Allowed) ->
     case Allowed of
         <<"*.", Suffix/binary>> ->
@@ -278,10 +255,9 @@ make_key_share(Exts) ->
         _ -> error({protocol_error, tls_missing_key_share_ext, Exts})
     end.
 
--compile({inline, [is_valid_group/1]}).
 is_valid_group(G) ->
     G =:= 16#0017 orelse G =:= 16#0018 orelse G =:= 16#0019 orelse 
-    G =:= 16#001D orelse G =:= 16#001E orelse (G >= 16#0100 andalso G =<= 16#0104).
+    G =:= 16#001D orelse G =:= 16#001E orelse (G >= 16#0100 andalso G =< 16#0104).
 
 make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
     KSLen = byte_size(KeyShareKey),
@@ -293,9 +269,9 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
     SessionSize = byte_size(SessionId),
     Payload = [<<?TLS_12_VERSION, Digest:?DIGEST_LEN/binary, SessionSize,
                  SessionId/binary, ?TLS_CIPHERSUITE, 0, ExtLen:?u16>>, Extensions],
-    [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
+    PayloadSize = iolist_size(Payload),
+    [<<?TLS_TAG_SRV_HELLO, PayloadSize:?u24>> | Payload].
 
-%% Optimized Fisher-Yates shuffle
 shuffle_list([]) -> [];
 shuffle_list([_] = L) -> L;
 shuffle_list(List) ->
@@ -322,9 +298,11 @@ make_client_hello(Secret, SniDomain) ->
 make_client_hello(Timestamp, SessionId, HexSecret, SniDomain) when byte_size(HexSecret) == 32 ->
     make_client_hello(Timestamp, SessionId, mtp_handler:unhex(HexSecret), SniDomain);
 make_client_hello(Timestamp, SessionId, Secret, SniDomain) ->
-    Profile = lists:nth(rand:uniform(length(?TLS_FINGERPRINT_PROFILES)), ?TLS_FINGERPRINT_PROFILES),
+    Profiles = ?TLS_FINGERPRINT_PROFILES,
+    Profile = lists:nth(rand:uniform(length(Profiles)), Profiles),
     
-    CipherSuites = << <<S:?u16>> || S <- maps:get(cipher_suites, Profile) >>,
+    RawCiphers = shuffle_list(maps:get(cipher_suites, Profile)),
+    CipherSuites = << <<S:?u16>> || S <- RawCiphers >>,
     SNI = make_sni([SniDomain]),
     
     ExtBin = iolist_to_binary([SNI, <<16#00, 16#2b, 3:?u16, 2, ?TLS_13_VERSION>>]),
@@ -370,7 +348,7 @@ tls_records_complete(_B, _N) -> false.
 
 new() -> #st{}.
 
-try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
+try_decode_packet(<<?TLS_REC_DATA, ?TLS_12_VERSION, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16, _:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
@@ -379,7 +357,6 @@ try_decode_packet(Bin, St) when byte_size(Bin) =< (?MAX_IN_PACKET_SIZE + 5) ->
 try_decode_packet(Bin, _St) ->
     error({protocol_error, tls_max_size, byte_size(Bin)}).
 
-%% Fast List Accumulation for decode_all
 decode_all(Bin, St) ->
     decode_all(Bin, [], St).
 
@@ -399,15 +376,12 @@ encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
 encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
     [as_tls_frame(?TLS_REC_DATA, Chunk) | encode_as_frames(Tail)].
 
--compile({inline, [as_tls_frame/2]}).
 as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),
     [<<Type, ?TLS_12_VERSION, Size:?u16>> | Data].
 
 -if(?OTP_RELEASE >= 23).
--compile({inline, [hmac/3]}).
 hmac(Algo, Key, Str) -> crypto:mac(hmac, Algo, Key, Str).
 -else.
--compile({inline, [hmac/3]}).
 hmac(Algo, Key, Str) -> crypto:hmac(Algo, Key, Str).
 -endif.

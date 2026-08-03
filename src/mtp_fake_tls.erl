@@ -2,7 +2,7 @@
 %%% @copyright (C) 2019, sergey
 %%% @doc
 %%% Fake TLS 'CBC' stream codec
-%%% Enhanced with DPI evasion techniques
+%%% Optimized for high-throughput & low memory allocation
 %%% @end
 
 -module(mtp_fake_tls).
@@ -30,13 +30,7 @@
 
 -dialyzer(no_improper_lists).
 
--record(st, {
-    %% DPI evasion settings
-    interleave_enabled = false :: boolean(),
-    padding_enabled = false :: boolean(),
-    record_size_limit = 16384 :: pos_integer(),
-    coalescing_enabled = false :: boolean()
-}).
+-record(st, {}).
 
 -record(client_hello,
         {pseudorandom :: binary(),
@@ -74,8 +68,6 @@
 -define(EXT_SNI_HOST_NAME, 0).
 -define(EXT_KEY_SHARE, 51).
 -define(EXT_SUPPORTED_VERSIONS, 43).
--define(EXT_SESSION_TICKET, 35).
--define(EXT_EARLY_DATA, 42).
 
 -define(GREASE_VALUES, [
     16#0a0a, 16#1a1a, 16#2a2a, 16#3a3a, 16#4a4a,
@@ -172,10 +164,6 @@ match_domain(Domain, Allowed) ->
         _ -> Domain =:= Allowed
     end.
 
-%% ============================================================================
-%% DPI Evasion: Enhanced ClientHello with GREASE and Randomization
-%% ============================================================================
-
 -spec from_client_hello(binary(), binary(), [binary()]) -> {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret, AllowedDomains) ->
     #client_hello{pseudorandom = ClientDigest,
@@ -203,53 +191,24 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     Zeroes =:= <<0:224>> orelse error({protocol_error, tls_invalid_digest}),
 
     KeyShare = make_key_share(Extensions),
-    
-    %% DPI Evasion: Add session ticket extension support
-    HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
-    HasEarlyData = lists:keymember(?EXT_EARLY_DATA, 1, Extensions),
-    
-    SrvHello0 = make_srv_hello(<<0:256>>, SessionId, KeyShare, HasSessionTicket),
+    SrvHello0 = make_srv_hello(<<0:256>>, SessionId, KeyShare),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
-    %% DPI Evasion: EncryptedExtensions for TLS 1.3 compliance
-    EncryptedExt = generate_encrypted_extensions(HasSessionTicket, HasEarlyData),
-    
     Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-                 as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt),
                  as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
                  as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
                  
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, HasSessionTicket),
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
     
-    %% DPI Evasion: Coalesce records for TLS 1.3
-    Response = case HasSessionTicket of
-        true ->
-            SessionTicket = generate_session_ticket(Secret),
-            [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-             as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt),
-             as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-             as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-             as_tls_frame(?TLS_REC_HANDSHAKE, SessionTicket)];
-        false ->
-            [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-             as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt),
-             as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-             as_tls_frame(?TLS_REC_DATA, FakeHttpData)]
-    end,
+    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
+                tl(Response0)],
 
     Meta = #{session_id => SessionId,
              timestamp => Timestamp,
              client_digest => ClientDigest,
              sni_domain => SniDomain},
-    
-    %% DPI Evasion: Enable features in state
-    St = #st{
-        interleave_enabled = true,
-        padding_enabled = true,
-        coalescing_enabled = true
-    },
-    {ok, Response, Meta, St}.
+    {ok, Response, Meta, new()}.
 
 from_client_hello(Data, Secret) ->
     from_client_hello(Data, Secret, []).
@@ -303,10 +262,6 @@ parse_extension(?EXT_SNI, <<_:?u16, List/binary>>) ->
     [{Type, Value} || <<Type, Len:?u16, Value:Len/binary>> <= List];
 parse_extension(?EXT_KEY_SHARE, <<_:?u16, Exts/binary>>) ->
     [{Group, Key} || <<Group:?u16, KeyLen:?u16, Key:KeyLen/binary>> <= Exts];
-parse_extension(?EXT_SESSION_TICKET, _Data) ->
-    {session_ticket, supported};
-parse_extension(?EXT_EARLY_DATA, _Data) ->
-    {early_data, supported};
 parse_extension(_Type, Data) ->
     Data.
 
@@ -328,57 +283,17 @@ is_valid_group(G) ->
     G =:= 16#0017 orelse G =:= 16#0018 orelse G =:= 16#0019 orelse 
     G =:= 16#001D orelse G =:= 16#001E orelse (G >= 16#0100 andalso G =<= 16#0104).
 
-make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, HasSessionTicket) ->
+make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
     KSLen = byte_size(KeyShareKey),
     KeyShareEntity = <<KeyShareGroup:?u16, KSLen:?u16, KeyShareKey/binary>>,
-    
-    %% DPI Evasion: Add session ticket extension if client supports it
-    ExtensionsBase = [
-        <<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16>>,
-        KeyShareEntity,
-        <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>
-    ],
-    
-    ExtensionsFinal = case HasSessionTicket of
-        true -> ExtensionsBase ++ [<<?EXT_SESSION_TICKET:?u16, 0:?u16>>];
-        false -> ExtensionsBase
-    end,
-    
-    ExtLen = iolist_size(ExtensionsFinal),
+    ExtLen = byte_size(KeyShareEntity) + 4 + 6,
+    Extensions = [<<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16>>,
+                  KeyShareEntity,
+                  <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>],
     SessionSize = byte_size(SessionId),
     Payload = [<<?TLS_12_VERSION, Digest:?DIGEST_LEN/binary, SessionSize,
-                 SessionId/binary, ?TLS_CIPHERSUITE, 0, ExtLen:?u16>>, ExtensionsFinal],
+                 SessionId/binary, ?TLS_CIPHERSUITE, 0, ExtLen:?u16>>, Extensions],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
-
-%% DPI Evasion: Generate EncryptedExtensions
-generate_encrypted_extensions(HasSessionTicket, HasEarlyData) ->
-    Extensions = case HasSessionTicket of
-        true -> [<<?EXT_SESSION_TICKET:?u16, 0:?u16>>];
-        false -> []
-    end ++ case HasEarlyData of
-        true -> [<<?EXT_EARLY_DATA:?u16, 0:?u16>>];
-        false -> []
-    end,
-    
-    ExtBin = iolist_to_binary(Extensions),
-    Payload = <<(byte_size(ExtBin)):?u16, ExtBin/binary>>,
-    [8, (iolist_size(Payload)):?u24 | Payload].
-
-%% DPI Evasion: Generate Session Ticket
-generate_session_ticket(_Secret) ->
-    TicketLifetime = 604800,
-    TicketAgeAdd = crypto:strong_rand_bytes(4),
-    TicketNonce = crypto:strong_rand_bytes(16),
-    Ticket = crypto:strong_rand_bytes(128),
-    
-    Payload = <<TicketLifetime:32,
-                TicketAgeAdd/binary,
-                (byte_size(TicketNonce)):8,
-                TicketNonce/binary,
-                (byte_size(Ticket)):?u16,
-                Ticket/binary,
-                0:?u16>>,
-    [4, (iolist_size(Payload)):?u24 | Payload].
 
 %% Optimized Fisher-Yates shuffle
 shuffle_list([]) -> [];
@@ -401,7 +316,6 @@ make_sni(Domains) ->
     ILen = byte_size(Items),
     <<?EXT_SNI:?u16, (ILen + 2):?u16, ILen:?u16, Items/binary>>.
 
-%% DPI Evasion: Enhanced ClientHello with GREASE
 make_client_hello(Secret, SniDomain) ->
     make_client_hello(erlang:system_time(second), crypto:strong_rand_bytes(32), Secret, SniDomain).
 
@@ -413,11 +327,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) ->
     CipherSuites = << <<S:?u16>> || S <- maps:get(cipher_suites, Profile) >>,
     SNI = make_sni([SniDomain]),
     
-    %% DPI Evasion: Add GREASE, ALPN, and more extensions
-    ALPN = build_alpn(Profile),
-    SupportedVersions = <<?EXT_SUPPORTED_VERSIONS:?u16, 3:?u16, 2, ?TLS_13_VERSION>>,
-    
-    ExtBin = iolist_to_binary([SNI, ALPN, SupportedVersions]),
+    ExtBin = iolist_to_binary([SNI, <<16#00, 16#2b, 3:?u16, 2, ?TLS_13_VERSION>>]),
     CSLen = byte_size(CipherSuites),
     ExtLen = byte_size(ExtBin),
     HelloBodyLen = 38 + CSLen + 4 + ExtLen,
@@ -435,23 +345,10 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) ->
     EncTimestamp = <<0:224, Timestamp:32/unsigned-little>>,
     Pack(crypto:exor(Digest, EncTimestamp)).
 
-%% DPI Evasion: Build ALPN extension
-build_alpn(#{alpn_protocols := Protocols}) ->
-    Selected = lists:nth(rand:uniform(length(Protocols)), Protocols),
-    ProtocolEntries = << <<(byte_size(P)):8, P/binary>> || P <- Selected >>,
-    ProtocolsLen = byte_size(ProtocolEntries),
-    <<16#00, 16#10, (ProtocolsLen + 2):?u16, ProtocolsLen:?u16, ProtocolEntries/binary>>;
-build_alpn(_) -> <<>>.
-
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
-                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, EELen:?u16, EncExt:EELen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary, Tail/binary>>) ->
-    {Handshake, EncExt, ChangeCipher, Data, Tail};
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary, Tail/binary>>) ->
-    {Handshake, <<>>, ChangeCipher, Data, Tail};
+    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 -> incomplete;
 parse_server_hello(<<16#16, _/binary>> = B) ->
     case tls_records_complete(B, 3) of
@@ -468,15 +365,10 @@ tls_records_complete(<<_T, _Mj, _Mn, Len:?u16, Rest/binary>>, N) when byte_size(
 tls_records_complete(_B, _N) -> false.
 
 %% ============================================================================
-%% Stream Codec Logic with DPI Evasion
+%% Stream Codec Logic
 %% ============================================================================
 
-new() -> 
-    #st{
-        interleave_enabled = true,
-        padding_enabled = true,
-        coalescing_enabled = true
-    }.
+new() -> #st{}.
 
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
@@ -499,75 +391,13 @@ decode_all(Bin, Acc, St0) ->
             decode_all(Tail, [Data | Acc], St)
     end.
 
-%% DPI Evasion: Enhanced encode_packet with padding and interleaving
 encode_packet(Bin, St) ->
-    #st{
-        interleave_enabled = Interleave,
-        padding_enabled = Padding,
-        record_size_limit = Limit,
-        coalescing_enabled = Coalescing
-    } = St,
-    
-    Encoded = encode_as_frames(Bin, Limit),
-    
-    %% Apply DPI evasion techniques
-    WithPadding = case Padding of
-        true -> apply_padding(Encoded);
-        false -> Encoded
-    end,
-    
-    WithInterleave = case Interleave of
-        true -> interleave_with_dummy(WithPadding);
-        false -> WithPadding
-    end,
-    
-    {WithInterleave, St}.
+    {encode_as_frames(Bin), St}.
 
-encode_as_frames(Bin, Limit) when byte_size(Bin) =< Limit ->
+encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
     as_tls_frame(?TLS_REC_DATA, Bin);
-encode_as_frames(<<Chunk:Limit/binary, Tail/binary>>, Limit) ->
-    [as_tls_frame(?TLS_REC_DATA, Chunk) | encode_as_frames(Tail, Limit)].
-
-%% DPI Evasion: Apply realistic padding
-apply_padding(Frames) when is_list(Frames) ->
-    [apply_padding_to_frame(F) || F <- Frames];
-apply_padding(Frame) ->
-    apply_padding_to_frame(Frame).
-
-apply_padding_to_frame(Frame) ->
-    %% Randomly pad ~30% of frames to realistic sizes
-    case rand:uniform(10) =< 3 of
-        true ->
-            %% Add padding to look like real traffic
-            PadSize = rand:uniform(512),
-            Padding = crypto:strong_rand_bytes(PadSize),
-            [Frame, Padding];
-        false ->
-            Frame
-    end.
-
-%% DPI Evasion: Interleave with dummy records
-interleave_with_dummy(Frames) when is_list(Frames) ->
-    case rand:uniform(5) of
-        1 -> [generate_dummy_record() | Frames];
-        2 -> Frames ++ [generate_dummy_record()];
-        _ -> Frames
-    end;
-interleave_with_dummy(Frame) ->
-    interleave_with_dummy([Frame]).
-
-generate_dummy_record() ->
-    case rand:uniform(4) of
-        1 -> <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>;
-        2 -> <<?TLS_REC_ALERT, ?TLS_12_VERSION, 0, 2, 1, 0>>;
-        3 ->
-            FragLen = rand:uniform(50) + 10,
-            Frag = crypto:strong_rand_bytes(FragLen),
-            <<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, (FragLen + 4):?u16,
-              0, 0, 0, FragLen, Frag/binary>>;
-        4 ->
-            <<?TLS_REC_DATA, ?TLS_13_VERSION, 0, 1, 0>>
-    end.
+encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
+    [as_tls_frame(?TLS_REC_DATA, Chunk) | encode_as_frames(Tail)].
 
 -compile({inline, [as_tls_frame/2]}).
 as_tls_frame(Type, Data) ->

@@ -330,26 +330,6 @@
 ]).
 
 %% ============================================================================
-%% ECH with realistic payload patterns
-%% ============================================================================
--define(ECH_REAL_PATTERNS, [
-    <<16#fe, 16#0d, 176:?u16,
-      16#00, 16#00, 16#01, 16#00, 16#01, 16#00,
-      16#00, 16#20, 0:256,
-      16#00, 16#10, 0:128>>,
-    
-    <<16#fe, 16#0d, 208:?u16,
-      16#00, 16#00, 16#01, 16#00, 16#01, 16#00, 16#00,
-      16#00, 16#20, 0:256,
-      16#00, 16#20, 0:256>>,
-    
-    <<16#fe, 16#0d, 240:?u16,
-      16#00, 16#00, 16#02, 16#00, 16#01, 16#00, 16#02, 16#00,
-      16#00, 16#20, 0:256,
-      16#00, 16#30, 0:384>>
-]).
-
-%% ============================================================================
 %% OCSP Response Cache
 %% ============================================================================
 -record(ocsp_cache, {
@@ -371,20 +351,30 @@ current_time() ->
 
 weighted_random_selection() ->
     Rand = rand:uniform(),
-    select_from_distribution(?PADDING_DISTRIBUTION, Rand).
+    select_from_distribution(?PADDING_DISTRIBUTION, Rand, 0).
 
-select_from_distribution([], _) ->
+select_from_distribution([], _, _) ->
     {40, 150};
-select_from_distribution([{{Min, Max}, Weight} | Rest], Rand) when Rand =< Weight ->
+select_from_distribution([{{Min, Max}, Weight} | _Rest], Rand, Acc) when Rand =< (Acc + Weight) ->
     {Min, Max};
-select_from_distribution([_ | Rest], Rand) ->
-    select_from_distribution(Rest, Rand).
+select_from_distribution([_ | Rest], Rand, Acc) ->
+    select_from_distribution(Rest, Rand, Acc).
 
 generate_realistic_serial() ->
     Prefixes = [<<"00F1">>, <<"00A1">>, <<"00C1">>, <<"00B2">>, <<"00E3">>],
     Prefix = lists:nth(rand:uniform(length(Prefixes)), Prefixes),
     Suffix = crypto:strong_rand_bytes(6),
     <<Prefix/binary, Suffix/binary>>.
+
+%% ============================================================================
+%% Encode GeneralizedTime for OCSP
+%% ============================================================================
+-spec encode_generalized_time(non_neg_integer()) -> binary().
+encode_generalized_time(Timestamp) ->
+    DateTime = calendar:gregorian_seconds_to_datetime(Timestamp + 62167219200),
+    {{Y, M, D}, {H, Mi, S}} = calendar:universal_time_to_local_time(DateTime),
+    Str = io_lib:format("~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ", [Y, M, D, H, Mi, S]),
+    list_to_binary(Str).
 
 %% ============================================================================
 %% format TLS secret
@@ -473,18 +463,22 @@ generate_realistic_ocsp_response() ->
                (byte_size(SerialNumber)):8,
                SerialNumber/binary>>,
     
+    ThisUpdateBin = encode_generalized_time(ThisUpdate),
+    NextUpdateBin = encode_generalized_time(NextUpdate),
+    
     SingleResponse = <<CertId/binary,
                        CertStatus/binary,
-                       (encode_generalized_time(ThisUpdate))/binary,
-                       (encode_generalized_time(NextUpdate))/binary>>,
+                       ThisUpdateBin/binary,
+                       NextUpdateBin/binary>>,
     
     Responses = <<(byte_size(SingleResponse)):24,
                   SingleResponse/binary>>,
     
     ResponderId = crypto:strong_rand_bytes(20),
+    ProducedAtBin = encode_generalized_time(ThisUpdate),
     ResponseData = <<0,
                      ResponderId/binary,
-                     (encode_generalized_time(ThisUpdate))/binary,
+                     ProducedAtBin/binary,
                      Responses/binary>>,
     
     Signature = generate_realistic_signature(),
@@ -662,12 +656,12 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         false -> <<>>
     end,
     
-    Response0 = [_, CC, DD, ST, EE] =
-        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-         TicketRecord,
-         as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt)],
+    SrvHello0Frame = as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+    CCFrame = as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
+    DDFrame = as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+    EEFrame = as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt),
+    
+    Response0 = [SrvHello0Frame, CCFrame, DDFrame, TicketRecord, EEFrame],
     
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
@@ -704,10 +698,10 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                      EarlyData | as_tls_frame(?TLS_REC_DATA, FakeHttpData)]
             end;
         true ->
+            SrvHelloFrame = as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
+            EEFrame2 = as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt),
             coalesce_with_control_messages(
-                [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-                 as_tls_frame(?TLS_REC_HANDSHAKE, EncryptedExt),
-                 CC, DD, ST],
+                [SrvHelloFrame, EEFrame2, CCFrame, DDFrame, TicketRecord],
                 St0,
                 Secret
             )
@@ -1253,9 +1247,11 @@ build_sig_algos(#{sig_algorithms_count := Count}) ->
 build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
     PayloadSize = lists:nth(rand:uniform(length(Sizes)), Sizes),
     Payload = crypto:strong_rand_bytes(PayloadSize),
+    RandByte = crypto:strong_rand_bytes(1),
+    RandKey = crypto:strong_rand_bytes(32),
     EchContent = <<16#00, 16#00, 16#01, 16#00, 16#01,
-                    crypto:strong_rand_bytes(1)/binary,
-                    16#00, 16#20, crypto:strong_rand_bytes(32)/binary,
+                    RandByte/binary,
+                    16#00, 16#20, RandKey/binary,
                     (byte_size(Payload)):?u16, Payload/binary>>,
     <<16#fe, 16#0d, (byte_size(EchContent)):?u16, EchContent/binary>>;
 build_ech(_) -> <<>>.

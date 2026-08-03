@@ -449,39 +449,40 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                                HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
-    %% Generate Session Ticket if client supports it
-    {SessionTicket, TicketRecord} = case HasSessionTicket of
-        true ->
-            Ticket = generate_session_ticket(Secret),
-            TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
-            {Ticket, TicketRecord2};
-        false ->
-            {undefined, <<>>}
-    end,
-    
-    %% Generate OCSP response if client supports it
-    OcspResponse = case HasOcspStapling of
-        true ->
-            generate_ocsp_response(ServerDigest);
-        false ->
-            undefined
-    end,
-    
-    %% Build initial response without proper digest
-    Response0 = [_, CC, DD, ST] =
-        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-         TicketRecord],
-    
-    %% Calculate digest with complete response
-    SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
-                              HasSessionTicket, HasOcspStapling),
-    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-                CC,
-                DD,
-                ST],
+%% Generate Session Ticket if client supports it (AFTER digest calculation)
+{SessionTicket, TicketRecord} = case HasSessionTicket of
+    true ->
+        Ticket = generate_session_ticket(Secret),
+        TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
+        {Ticket, TicketRecord2};
+    false ->
+        {undefined, <<>>}
+end,
+
+%% Generate OCSP response if client supports it
+OcspResponse = case HasOcspStapling of
+    true ->
+        generate_ocsp_response(ServerDigest);
+    false ->
+        undefined
+end,
+
+%% Build base response WITHOUT session ticket for digest calculation
+ResponseBase = [_, CC, DD] =
+    [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+     as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
+     as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
+
+%% Calculate digest with base response (matching original ClientHello structure)
+SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | ResponseBase]),
+SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
+                          HasSessionTicket, HasOcspStapling),
+
+%% Build final response with Session Ticket added AFTER digest
+Response = case TicketRecord of
+    <<>> -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD];
+    _    -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD, TicketRecord]
+end,
     
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,

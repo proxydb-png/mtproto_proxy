@@ -5,6 +5,7 @@
 %%% - Smart padding with realistic distributions
 %%% - Configurable jitter
 %%% - Variable record size limits
+%%% - Session Ticket & OCSP Stapling support
 %%% @end
 -module(mtp_fake_tls).
 
@@ -38,7 +39,8 @@
     interleave_enabled = false :: boolean(),
     padding_enabled = false :: boolean(),
     session_ticket :: binary() | undefined,
-    ocsp_response :: binary() | undefined
+    ocsp_response :: binary() | undefined,
+    session_ticket_lifetime :: non_neg_integer() | undefined
 }).
 
 -record(client_hello,
@@ -73,6 +75,7 @@
 
 -define(TLS_TAG_CLI_HELLO, 1).
 -define(TLS_TAG_SRV_HELLO, 2).
+-define(TLS_TAG_NEW_SESSION_TICKET, 4).
 -define(TLS_CIPHERSUITE, 192, 47).
 -define(TLS_CHANGE_CIPHER, ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1).
 
@@ -80,6 +83,8 @@
 -define(EXT_SNI_HOST_NAME, 0).
 -define(EXT_KEY_SHARE, 51).
 -define(EXT_SUPPORTED_VERSIONS, 43).
+-define(EXT_SESSION_TICKET, 35).
+-define(EXT_STATUS_REQUEST, 5).
 
 -define(APP, mtproto_proxy).
 
@@ -140,7 +145,9 @@
           [<<"h2">>],
           [<<"http/1.1">>]
       ],
-      padding_size => {0, 512}
+      padding_size => {0, 512},
+      session_ticket_enabled => true,
+      ocsp_stapling_enabled => true
     },
     #{name => firefox_121,
       cipher_suites => [
@@ -182,7 +189,9 @@
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 256}
+      padding_size => {0, 256},
+      session_ticket_enabled => true,
+      ocsp_stapling_enabled => false
     },
     #{name => safari_17,
       cipher_suites => [
@@ -219,7 +228,9 @@
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 512}
+      padding_size => {0, 512},
+      session_ticket_enabled => false,
+      ocsp_stapling_enabled => true
     },
     #{name => edge_120,
       cipher_suites => [
@@ -261,7 +272,9 @@
           [<<"h2">>, <<"http/1.1">>],
           [<<"h2">>]
       ],
-      padding_size => {0, 512}
+      padding_size => {0, 512},
+      session_ticket_enabled => true,
+      ocsp_stapling_enabled => true
     }
 ]).
 
@@ -270,7 +283,9 @@
 -type meta() :: #{session_id := binary(),
                   timestamp := non_neg_integer(),
                   client_digest := binary(),
-                  sni_domain => binary()}.
+                  sni_domain => binary(),
+                  session_ticket => binary() | undefined,
+                  ocsp_response => binary() | undefined}.
 
 
 %% ============================================================================
@@ -326,7 +341,64 @@ match_domain(Domain, Allowed) ->
     end.
 
 %% ============================================================================
+%% @doc Generate fake OCSP response (optimized)
+%% @end
+%% ============================================================================
+-spec generate_ocsp_response(binary()) -> binary().
+generate_ocsp_response(_ServerDigest) ->
+    %% Generate a realistic-looking OCSP response
+    %% OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
+    OcspStatus = 0,
+    %% Basic OCSP Response structure
+    ResponderId = crypto:strong_rand_bytes(20),  % SHA1 hash
+    ProducedAt = erlang:system_time(seconds),
+    %% This update + 7 days
+    ThisUpdate = ProducedAt,
+    NextUpdate = ProducedAt + 604800,
+    %% Single response for our certificate
+    CertId = crypto:strong_rand_bytes(36),  % HashAlgorithm + IssuerNameHash + IssuerKeyHash + SerialNumber
+    CertStatus = <<0>>,  % good
+    SingleResponse = <<CertId/binary, CertStatus/binary,
+                        (encode_generalized_time(ThisUpdate))/binary,
+                        (encode_generalized_time(NextUpdate))/binary>>,
+    Responses = <<1:32, SingleResponse/binary>>,
+    ResponseData = <<0, ResponderId/binary,
+                     (encode_generalized_time(ProducedAt))/binary,
+                     Responses/binary>>,
+    Signature = crypto:strong_rand_bytes(256),
+    BasicOcspResponse = <<ResponseData/binary, 1:24, Signature/binary>>,
+    <<OcspStatus, (byte_size(BasicOcspResponse)):?u24, BasicOcspResponse/binary>>.
+
+%% ============================================================================
+%% @doc Encode GeneralizedTime for OCSP
+%% @end
+%% ============================================================================
+-spec encode_generalized_time(non_neg_integer()) -> binary().
+encode_generalized_time(Timestamp) ->
+    DateTime = calendar:gregorian_seconds_to_datetime(Timestamp + 62167219200),
+    {{Y, M, D}, {H, Mi, S}} = calendar:universal_time_to_local_time(DateTime),
+    Str = io_lib:format("~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ", [Y, M, D, H, Mi, S]),
+    list_to_binary(Str).
+
+%% ============================================================================
+%% @doc Generate Session Ticket (optimized)
+%% @end
+%% ============================================================================
+-spec generate_session_ticket(binary()) -> binary().
+generate_session_ticket(_Secret) ->
+    TicketAgeAdd = crypto:strong_rand_bytes(4),
+    TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
+    Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
+    TicketLifetime = 604800,  % 7 days
+    
+    <<TicketLifetime:32, TicketAgeAdd/binary,
+      (byte_size(TicketNonce)):8, TicketNonce/binary,
+      (byte_size(Ticket)):?u16, Ticket/binary,
+      0:?u16>>.  % No extensions
+
+%% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
+%% Enhanced with Session Ticket and OCSP support
 %% Version WITH domain checking.
 %% @end
 %% ============================================================================
@@ -362,28 +434,71 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             end
     end,
 
+    %% Check if client supports session ticket and OCSP
+    HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
+    HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
+
+    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p",
+               [HasSessionTicket, HasOcspStapling]),
+
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
         crypto:exor(ClientDigest, ServerDigest),
     lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
         error({protocol_error, tls_invalid_digest, XoredDigest}),
     KeyShare = make_key_share(Extensions),
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
+    
+    %% Generate Session Ticket and OCSP response if needed
+    SessionTicket = case HasSessionTicket of
+        true -> generate_session_ticket(Secret);
+        false -> undefined
+    end,
+    
+    OcspResponse = case HasOcspStapling of
+        true -> generate_ocsp_response(ServerDigest);
+        false -> undefined
+    end,
+    
+    %% Build ServerHello with session ticket and OCSP extensions
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare,
+                               HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
-    Response0 = [_, CC, DD] =
+    
+    %% Build response records
+    TicketRecord = case HasSessionTicket of
+        true -> as_tls_frame(?TLS_REC_HANDSHAKE, SessionTicket);
+        false -> <<>>
+    end,
+    
+    Response0 = [_, CC, DD, ST] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
+         as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+         TicketRecord],
+    
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
-    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-                CC,
-                DD],
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
+                              HasSessionTicket, HasOcspStapling),
+    
+    Response = case TicketRecord of
+        <<>> -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD];
+        _    -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD, ST]
+    end,
+    
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
-              client_digest => ClientDigest},
-    Meta = Meta0#{sni_domain => SniDomain},
-    {ok, Response, Meta, new()}.
+              client_digest => ClientDigest,
+              sni_domain => SniDomain},
+    Meta = Meta0#{session_ticket => SessionTicket,
+                  ocsp_response => OcspResponse},
+    
+    St = #st{session_ticket = SessionTicket,
+             ocsp_response = OcspResponse,
+             session_ticket_lifetime = case HasSessionTicket of
+                                          true -> 604800;
+                                          false -> undefined
+                                      end},
+    {ok, Response, Meta, St}.
 
 %% ============================================================================
 %% @doc Backward-compatible version without domain checking.
@@ -459,6 +574,10 @@ parse_extension(?EXT_SNI, <<ListLen:?u16, List:ListLen/binary>>) ->
 parse_extension(?EXT_KEY_SHARE, <<Len:?u16, Exts:Len/binary>>) ->
     [{Group, Key}
      || <<Group:?u16, KeyLen:?u16, Key:KeyLen/binary>> <= Exts];
+parse_extension(?EXT_SESSION_TICKET, _Data) ->
+    {session_ticket, supported};
+parse_extension(?EXT_STATUS_REQUEST, <<Type, _Rest/binary>>) ->
+    {ocsp_stapling, Type};
 parse_extension(_Type, Data) ->
     Data.
 
@@ -501,12 +620,31 @@ make_key_share(Exts) ->
             error({protocol_error, tls_missing_key_share_ext, Exts})
     end.
 
-make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
+make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey},
+               HasSessionTicket, HasOcspStapling) ->
     KeyShareEntity = <<KeyShareGroup:?u16, (byte_size(KeyShareKey)):?u16, KeyShareKey/binary>>,
-    Extensions =
-        [<<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16>>,
-         KeyShareEntity,
-         <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>],
+    
+    ExtensionsBase = [
+        <<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16, KeyShareEntity/binary>>,
+        <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>
+    ],
+    
+    %% Add Session Ticket extension if client supports it
+    ExtensionsWithTicket = case HasSessionTicket of
+        true ->
+            ExtensionsBase ++ [<<?EXT_SESSION_TICKET:?u16, 0:?u16>>];
+        false ->
+            ExtensionsBase
+    end,
+    
+    %% Add OCSP stapling extension if client supports it
+    ExtensionsFinal = case HasOcspStapling of
+        true ->
+            ExtensionsWithTicket ++ [<<?EXT_STATUS_REQUEST:?u16, 0:?u16>>];
+        false ->
+            ExtensionsWithTicket
+    end,
+    
     SessionSize = byte_size(SessionId),
     Payload = [<<?TLS_12_VERSION,
                  Digest:?DIGEST_LEN/binary,
@@ -514,8 +652,8 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
                  SessionId:SessionSize/binary,
                  ?TLS_CIPHERSUITE,
                  0,
-                 (iolist_size(Extensions)):?u16>>
-                   | Extensions],
+                 (iolist_size(ExtensionsFinal)):?u16>>
+                   | ExtensionsFinal],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %% ============================================================================
@@ -762,6 +900,28 @@ build_padding(_) ->
     <<>>.
 
 %% ============================================================================
+%% @doc Build Session Ticket extension for ClientHello
+%% @end
+%% ============================================================================
+-spec build_session_ticket_ext(map()) -> binary().
+build_session_ticket_ext(#{session_ticket_enabled := true}) ->
+    %% Empty session ticket extension - client indicates support
+    <<?EXT_SESSION_TICKET:?u16, 0:?u16>>;
+build_session_ticket_ext(_) ->
+    <<>>.
+
+%% ============================================================================
+%% @doc Build OCSP stapling extension for ClientHello  
+%% @end
+%% ============================================================================
+-spec build_ocsp_stapling_ext(map()) -> binary().
+build_ocsp_stapling_ext(#{ocsp_stapling_enabled := true}) ->
+    %% status_request extension with OCSP type
+    <<?EXT_STATUS_REQUEST:?u16, 0:?u16>>;
+build_ocsp_stapling_ext(_) ->
+    <<>>.
+
+%% ============================================================================
 %% @doc Build SNI extension
 %% @end
 %% ============================================================================
@@ -772,7 +932,7 @@ make_sni(Domains) ->
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
 %% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with random fingerprint.
+%% @doc Generate Fake-TLS "ClientHello" with random fingerprint and Session Ticket/OCSP support.
 %% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
@@ -813,11 +973,13 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     CompCertExt = build_compress_certificate(Profile),
     EcPointExt = build_ec_point_formats(Profile),
     PaddingExt = build_padding(Profile),
+    SessionTicketExt = build_session_ticket_ext(Profile),
+    OcspStaplingExt = build_ocsp_stapling_ext(Profile),
 
     ExtensionsBase = [
         ECH,
-        <<16#00, 16#23, 0:16>>,                      % session_ticket
-        EcPointExt,
+        SessionTicketExt,                            % Session Ticket
+        EcPointExt,                                   % EC point formats
         <<16#44, 16#cd, 16#00, 16#05,
           16#00, 16#03, 16#02, $h, $2>>,             % application_layer_protocol_settings
         KeyShare,
@@ -826,8 +988,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
         CompCertExt,
         <<16#ff, 16#01, 16#00, 16#01, 16#00>>,       % renegotiation_info
         SigAlgos,
-        <<16#00, 16#05, 16#00, 16#05,
-          16#01, 0:32>>,                             % status_request (OCSP)
+        OcspStaplingExt,                              % OCSP Stapling
         <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>, % psk_key_exchange_modes
         ALPN,
         SNI,
@@ -866,6 +1027,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
 
 %% ============================================================================
 %% @doc Parses "ServerHello" (the one produced by from_client_hello/2).
+%% Enhanced to handle Session Ticket and OCSP responses
 %% @end
 %% ============================================================================
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
@@ -873,10 +1035,17 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
+                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
+                     Tail/binary>>) ->
+    %% ServerHello with Session Ticket
+    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
 parse_server_hello(<<16#16, _/binary>> = B) ->
-    case tls_records_complete(B, 3) of
+    case tls_records_complete(B, 4) of
         true  -> {error, tls_domain_forwarding};
         false -> incomplete
     end;
@@ -895,7 +1064,7 @@ tls_records_complete(_B, _N) ->
     false.
 
 %% ============================================================================
-%% Data stream codec
+%% Data stream codec with DPI evasion
 %% ============================================================================
 
 -spec new() -> codec().

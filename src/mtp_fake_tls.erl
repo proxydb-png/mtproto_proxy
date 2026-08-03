@@ -1,6 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc
 %%% Highly Optimized & Advanced Dynamic Fake TLS Processor for MTProto Proxy
+%%% - Fixed TLS Pattern Matching (illegal pattern fixed)
 %%% - Fixed TLS 1.3 NewSessionTicket Handshake Framing (Tag 4 + 24-bit Length)
 %%% - Corrected Record/Handshake Pattern Matching Order
 %%% - Optimized Memory & GC ($O(N)$ decoding via iolists)
@@ -24,9 +25,10 @@
     parse_sni/1
 ]).
 
-%% TLS Macros & Constants
+%% TLS Version Byte Constants for Pattern Matching
+-define(TLS_12_MAJOR, 16#03).
+-define(TLS_12_MINOR, 16#03).
 -define(TLS_12_VERSION, <<16#03, 16#03>>).
--define(TLS_13_VERSION, <<16#03, 16#04>>).
 
 -define(TLS_REC_CHANGE_CIPHER, 20).
 -define(TLS_REC_ALERT, 21).
@@ -75,11 +77,11 @@
             16#C02B, 16#C02F, 16#C02C, 16#C030,
             16#CCA9, 16#CCA8, 16#C013, 16#C014
         ],
-        groups => [16#001D, 16#0017, 16#0018, 16#11EC], % 16#11EC: X25519MLKEM768 (PQ)
+        groups => [16#001D, 16#0017, 16#0018, 16#11EC],
         alpn => [<<"h2">>, <<"http/1.1">>],
         has_padding => true,
         has_ech => true,
-        compress_cert => [1, 2] % Brotli, Zlib
+        compress_cert => [1, 2]
     },
     #{
         name => firefox_121,
@@ -160,8 +162,8 @@ from_client_hello(ClientHello, Secret, AllowedDomains) ->
             {error, invalid_client_hello}
     end.
 
-parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, _Len:?u16,
-                     ?TLS_TAG_CLIENT_HELLO, _HSLen:?u24, ?TLS_12_VERSION,
+parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_MAJOR, ?TLS_12_MINOR, _Len:?u16,
+                     ?TLS_TAG_CLIENT_HELLO, _HSLen:?u24, ?TLS_12_MAJOR, ?TLS_12_MINOR,
                      _Random:32/binary,
                      SessionIdLen:8, _SessionId:SessionIdLen/binary,
                      CiphersLen:?u16, _Ciphers:CiphersLen/binary,
@@ -174,17 +176,17 @@ parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, _Len:?u16,
 parse_client_hello(_) ->
     error.
 
-%% Corrected Pattern Matching: Specific (With Ticket) matched first
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
-                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, Ticket:TicketLen/binary,
+%% Corrected Pattern Matching with explicit byte constants
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_MAJOR, ?TLS_12_MINOR, HSLen:?u16, Handshake:HSLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_MAJOR, ?TLS_12_MINOR, CCLen:?u16, ChangeCipher:CCLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_MAJOR, ?TLS_12_MINOR, DLen:?u16, Data:DLen/binary,
+                     ?TLS_REC_HANDSHAKE, ?TLS_12_MAJOR, ?TLS_12_MINOR, TicketLen:?u16, Ticket:TicketLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Ticket, Tail};
 
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_MAJOR, ?TLS_12_MINOR, HSLen:?u16, Handshake:HSLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_MAJOR, ?TLS_12_MINOR, CCLen:?u16, ChangeCipher:CCLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_MAJOR, ?TLS_12_MINOR, DLen:?u16, Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
 
@@ -245,7 +247,7 @@ make_server_hello(#st{session_id = ClientSessionId, secret = Secret, ocsp_respon
         ?TLS_12_VERSION,
         Random,
         <<(byte_size(SessionId)):8>>, SessionId,
-        <<16#13, 16#01>>, % TLS_AES_128_GCM_SHA256
+        <<16#13, 16#01>>,
         <<0:8>>,
         <<(byte_size(ExtsBin)):?u16>>, ExtsBin
     ],
@@ -258,21 +260,18 @@ make_server_hello(#st{session_id = ClientSessionId, secret = Secret, ocsp_respon
     Rec0 = [<<?TLS_REC_HANDSHAKE>>, ?TLS_12_VERSION, <<(byte_size(HandshakeBin)):?u16>>, HandshakeBin],
     Rec1 = [<<?TLS_REC_CHANGE_CIPHER>>, ?TLS_12_VERSION, <<1:?u16, 1:8>>],
     
-    % Server First Flight Packet Expansion (512 - 1024 bytes for realistic TLS Server Certificate/Response)
     FakeHttpData = crypto:strong_rand_bytes(512 + rand:uniform(512)),
     Rec2 = [<<?TLS_REC_DATA>>, ?TLS_12_VERSION, <<(byte_size(FakeHttpData)):?u16>>, FakeHttpData],
     
-    % RFC 5077 Session Ticket Handshake Frame Optimization
     SessionTicketPayload = generate_session_ticket(Secret),
     Rec3 = [<<?TLS_REC_HANDSHAKE>>, ?TLS_12_VERSION, <<(byte_size(SessionTicketPayload)):?u16>>, SessionTicketPayload],
     
-    % Stapled OCSP Response Frame
     OcspFrame = generate_ocsp_handshake_frame(OcspResp),
     Rec4 = [<<?TLS_REC_HANDSHAKE>>, ?TLS_12_VERSION, <<(byte_size(OcspFrame)):?u16>>, OcspFrame],
     
     iolist_to_binary([Rec0, Rec1, Rec2, Rec3, Rec4]).
 
-try_decode_packet(<<?TLS_REC_DATA, ?TLS_12_VERSION, Len:?u16, Data:Len/binary, Tail/binary>>, St) ->
+try_decode_packet(<<?TLS_REC_DATA, ?TLS_12_MAJOR, ?TLS_12_MINOR, Len:?u16, Data:Len/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, _/binary>>, St) ->
     {incomplete, St};
@@ -281,7 +280,6 @@ try_decode_packet(<<?TLS_REC_HANDSHAKE, _/binary>>, St) ->
 try_decode_packet(Bin, St) when is_binary(Bin) ->
     {incomplete, St}.
 
-%% Optimized O(N) Decoding Strategy using Iolists (Low Memory / Low GC Overhead)
 decode_all(Bin, St) ->
     decode_all(Bin, [], St).
 
@@ -305,8 +303,6 @@ parse_sni(Exts) ->
 
 parse_sni_exts(<<?EXT_SERVER_NAME:?u16, _Len:?u16, _ListLen:?u16, 0:8, NameLen:?u16, Domain:NameLen/binary, _/binary>>) ->
     {ok, Domain};
-parse_sni_exts(<<_:?u16, Len:?u16, Rest:Len/binary, Tail/binary>>) ->
-    parse_sni_exts(Tail);
 parse_sni_exts(<<_:?u16, Len:?u16, Tail/binary>>) when byte_size(Tail) >= Len ->
     <<_:Len/binary, Rest/binary>> = Tail,
     parse_sni_exts(Rest);
@@ -426,7 +422,7 @@ build_cert_compress_ext(Algs) ->
 
 build_ech_ext() ->
     ConfigId = rand:uniform(255),
-    KemId = 16#0020, % DHKEM(X25519, HKDF-SHA256)
+    KemId = 16#0020,
     PubKey = crypto:strong_rand_bytes(32),
     Payload = crypto:strong_rand_bytes(rand:uniform(64) + 128),
     Data = <<ConfigId:8, KemId:?u16, PubKey/binary, (byte_size(Payload)):?u16, Payload/binary>>,
@@ -443,13 +439,11 @@ get_random_grease() ->
 shuffle_list(List) ->
     [X || {_, X} <- lists:sort([{rand:uniform(), Item} || Item <- List])].
 
-%% Generates Standard-compliant RFC 5077 NewSessionTicket Handshake Frame
-%% Correct Format: Tag(1 byte: 4) + Length(24 bits) + Ticket Payload
 generate_session_ticket(_Secret) ->
     TicketAgeAdd = crypto:strong_rand_bytes(4),
     TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
     Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
-    TicketLifetime = 604800, % 7 days
+    TicketLifetime = 604800,
     
     Payload = <<TicketLifetime:32, TicketAgeAdd/binary, 
                 (byte_size(TicketNonce)):8, TicketNonce/binary,
@@ -467,8 +461,8 @@ generate_ocsp_response(Domain) ->
     CertId = crypto:strong_rand_bytes(32),
     Signature = crypto:strong_rand_bytes(256),
     
-    <<0:8, % OCSPResponseStatus: successful
-      48, 128, % Sequence
+    <<0:8,
+      48, 128,
       130, 0, (byte_size(Domain)):8, Domain/binary,
       ProducedAt/binary,
       NextUpdate/binary,
@@ -476,7 +470,7 @@ generate_ocsp_response(Domain) ->
       Signature/binary>>.
 
 generate_ocsp_handshake_frame(OcspResp) ->
-    StatusType = 1, % ocsp
+    StatusType = 1,
     RespLen = byte_size(OcspResp),
     Payload = <<StatusType:8, RespLen:?u24, OcspResp/binary>>,
     <<?TLS_TAG_CERT_STATUS, (byte_size(Payload)):?u24, Payload/binary>>.

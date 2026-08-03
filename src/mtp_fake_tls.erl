@@ -6,6 +6,7 @@
 %%% It's not real TLS, but it looks like TLS1.3 from outside
 %%% Enhanced with deep fingerprint randomization for maximum evasion
 %%% Added Session Ticket and OCSP stapling support
+%%% Fixed HMAC calculation for older client compatibility
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -344,18 +345,13 @@ match_domain(Domain, Allowed) ->
 %% ============================================================================
 -spec generate_ocsp_response(binary()) -> binary().
 generate_ocsp_response(_ServerDigest) ->
-    %% Generate a realistic-looking OCSP response
-    %% OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
     OcspStatus = 0,
-    %% Basic OCSP Response structure
-    ResponderId = crypto:strong_rand_bytes(20),  % SHA1 hash
+    ResponderId = crypto:strong_rand_bytes(20),
     ProducedAt = erlang:system_time(seconds),
-    %% This update + 7 days
     ThisUpdate = ProducedAt,
     NextUpdate = ProducedAt + 604800,
-    %% Single response for our certificate
-    CertId = crypto:strong_rand_bytes(36),  % HashAlgorithm + IssuerNameHash + IssuerKeyHash + SerialNumber
-    CertStatus = <<0>>,  % good
+    CertId = crypto:strong_rand_bytes(36),
+    CertStatus = <<0>>,
     SingleResponse = <<CertId/binary, CertStatus/binary, 
                         (encode_generalized_time(ThisUpdate))/binary,
                         (encode_generalized_time(NextUpdate))/binary>>,
@@ -388,16 +384,16 @@ generate_session_ticket(_Secret) ->
     TicketAgeAdd = crypto:strong_rand_bytes(4),
     TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
     Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
-    TicketLifetime = 604800,  % 7 days
-    
+    TicketLifetime = 604800,
     <<TicketLifetime:32, TicketAgeAdd/binary, 
       (byte_size(TicketNonce)):8, TicketNonce/binary,
       (byte_size(Ticket)):?u16, Ticket/binary,
-      0:?u16>>.  % No extensions
+      0:?u16>>.
 
 %% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
 %% Enhanced with Session Ticket and OCSP support
+%% HMAC calculated WITHOUT Session Ticket for older client compatibility
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -449,40 +445,40 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                                HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     
-%% Generate Session Ticket if client supports it (AFTER digest calculation)
-{SessionTicket, TicketRecord} = case HasSessionTicket of
-    true ->
-        Ticket = generate_session_ticket(Secret),
-        TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
-        {Ticket, TicketRecord2};
-    false ->
-        {undefined, <<>>}
-end,
-
-%% Generate OCSP response if client supports it
-OcspResponse = case HasOcspStapling of
-    true ->
-        generate_ocsp_response(ServerDigest);
-    false ->
-        undefined
-end,
-
-%% Build base response WITHOUT session ticket for digest calculation
-ResponseBase = [_, CC, DD] =
-    [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-     as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-     as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
-
-%% Calculate digest with base response (matching original ClientHello structure)
-SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | ResponseBase]),
-SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
-                          HasSessionTicket, HasOcspStapling),
-
-%% Build final response with Session Ticket added AFTER digest
-Response = case TicketRecord of
-    <<>> -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD];
-    _    -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD, TicketRecord]
-end,
+    %% Generate Session Ticket if client supports it (AFTER digest calculation)
+    {SessionTicket, TicketRecord} = case HasSessionTicket of
+        true ->
+            Ticket = generate_session_ticket(Secret),
+            TicketRecord2 = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
+            {Ticket, TicketRecord2};
+        false ->
+            {undefined, <<>>}
+    end,
+    
+    %% Generate OCSP response if client supports it
+    OcspResponse = case HasOcspStapling of
+        true ->
+            generate_ocsp_response(ServerDigest);
+        false ->
+            undefined
+    end,
+    
+    %% Build base response WITHOUT session ticket for digest calculation
+    ResponseBase = [_, CC, DD] =
+        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
+         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
+    
+    %% Calculate digest with base response (matching original ClientHello structure)
+    SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | ResponseBase]),
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, 
+                              HasSessionTicket, HasOcspStapling),
+    
+    %% Build final response with Session Ticket added AFTER digest
+    Response = case TicketRecord of
+        <<>> -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD];
+        _    -> [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), CC, DD, TicketRecord]
+    end,
     
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
@@ -693,14 +689,12 @@ build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, Greas
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
-    %% Interleave GREASE values at random positions
     WithGrease = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
             lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
         end, Suites, GreaseVals),
     
-    %% Randomize order if profile says so
     Final = case maps:get(cipher_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
@@ -717,10 +711,8 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
-    %% GREASE entries (group + 1-byte key)
     GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
     
-    %% Real key share entries
     RealEntries = [
         begin
             KeySize = key_size_for_group(Group),
@@ -730,7 +722,6 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
         || Group <- Groups
     ],
     
-    %% Interleave GREASE randomly
     AllEntries = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
@@ -874,7 +865,6 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
     GreaseVals = random_grease(GreaseCount),
     
-    %% Interleave GREASE
     WithGrease = lists:foldl(
         fun(G, Acc) ->
             Pos = rand:uniform(length(Acc) + 1),
@@ -910,7 +900,6 @@ build_padding(_) ->
 %% ============================================================================
 -spec build_session_ticket_ext(map()) -> binary().
 build_session_ticket_ext(#{session_ticket_enabled := true}) ->
-    %% Empty session ticket extension - client indicates support
     <<?EXT_SESSION_TICKET:?u16, 0:?u16>>;
 build_session_ticket_ext(_) ->
     <<>>.
@@ -921,7 +910,6 @@ build_session_ticket_ext(_) ->
 %% ============================================================================
 -spec build_ocsp_stapling_ext(map()) -> binary().
 build_ocsp_stapling_ext(#{ocsp_stapling_enabled := true}) ->
-    %% status_request extension with OCSP type
     <<?EXT_STATUS_REQUEST:?u16, 0:?u16>>;
 build_ocsp_stapling_ext(_) ->
     <<>>.

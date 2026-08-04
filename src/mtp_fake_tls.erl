@@ -1,14 +1,13 @@
 %%%===================================================================
-%%% Fake TLS - STEALTH NUCLEAR v4.0
-%%% Approach: Realistic traffic simulation, not random noise
-%%% - Mimics real browser TLS 1.3 + HTTP/2 behavior
-%%% - Natural timing patterns with jitter
-%%% - Realistic ServerHello with actual HTTP/2 frames
-%%% - Randomized but protocol-compliant record sequences
-%%% - Connection lifecycle simulation (warm-up, steady, teardown)
+%%% XTLS-Reality Simulation for MTProto
+%%% 
+%%% چرا Reality بهتره:
+%%% ۱. SNI واقعی داره (نه جعلی)
+%%% ۲. Handshake با سرور واقعی انجام میشه
+%%% ۳. DPI نمیتونه تشخیص بده چون دقیقاً مثل ترافیک واقعیه
 %%%===================================================================
 
--module(mtp_fake_tls).
+-module(mtp_reality_tls).
 
 -behaviour(mtp_codec).
 
@@ -34,34 +33,17 @@
 -dialyzer(no_improper_lists).
 
 %%%===================================================================
-%%% Connection Lifecycle State
+%%% Records
 %%%===================================================================
 
--define(LIFECYCLE_WARMUP, 1).    %% Just connected - send handshake overhead
--define(LIFECYCLE_STEADY, 2).    %% Normal operation
--define(LIFECYCLE_BURST, 3).     %% Occasional burst (like page load)
-
 -record(st, {
-    %% Core TLS state
+    %% Session management
     session_ticket :: binary() | undefined,
     ocsp_response :: binary() | undefined,
     session_ticket_lifetime :: non_neg_integer() | undefined,
     
-    %% Lifecycle management
-    lifecycle = ?LIFECYCLE_WARMUP :: 1..3,
-    packets_sent = 0 :: non_neg_integer(),
-    lifecycle_change_at :: non_neg_integer(),
-    
-    %% HTTP/2 simulation
-    stream_id = 1 :: pos_integer(),
-    h2_settings_sent = false :: boolean(),
-    
-    %% Profile (for ClientHello generation)
-    current_profile :: map(),
-    
-    %% Packet scheduling
-    last_send_time :: non_neg_integer(),
-    inter_packet_gap_us :: non_neg_integer()
+    %% Packet counter for lifecycle simulation
+    packet_count = 0 :: non_neg_integer()
 }).
 
 -record(client_hello, {
@@ -117,56 +99,6 @@
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
 -define(EXT_KEY_SHARE,          51).
-
-%%%===================================================================
-%%% GREASE Values
-%%%===================================================================
-
--define(GREASE_VALUES, [
-    16#0a0a, 16#1a1a, 16#2a2a, 16#3a3a, 16#4a4a,
-    16#5a5a, 16#6a6a, 16#7a7a, 16#8a8a, 16#9a9a,
-    16#aaaa, 16#baba, 16#caca, 16#dada, 16#eaea,
-    16#fafa
-]).
-
-%%%===================================================================
-%%% Realistic TLS Profiles (focused on Chrome-like behavior)
-%%%===================================================================
-
--define(TLS_FINGERPRINT_PROFILES, [
-    #{name => chrome_120_stealth,
-      cipher_suites => [
-          16#1301, 16#1302, 16#1303,
-          16#c02b, 16#c02f, 16#c02c, 16#c030,
-          16#cca9, 16#cca8,
-          16#c013, 16#c014,
-          16#009c, 16#009d,
-          16#002f, 16#0035
-      ],
-      cipher_order_randomized => true,
-      grease_count => {2, 4},
-      key_share_groups => [
-          16#11ec, 16#001d, 16#0017, 16#0018
-      ],
-      supported_versions => [
-          16#0304, 16#0303
-      ],
-      version_order_randomized => true,
-      sig_algorithms_count => 15,
-      ec_point_formats => true,
-      ech_payload_size => [176, 208, 240],
-      session_id_length => {32, 32},
-      extensions_order_randomized => true,
-      alpn_protocols => [
-          [<<"h2">>, <<"http/1.1">>],
-          [<<"h2">>],
-          [<<"http/1.1">>]
-      ],
-      padding_size => {32, 512},
-      session_ticket_enabled => true,
-      ocsp_stapling_enabled => true
-    }
-]).
 
 %%%===================================================================
 %%% Types
@@ -227,106 +159,19 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% HTTP/2 Frame Builders (Realistic Protocol Simulation)
+%%% REALITY Approach: Use real TLS behavior, minimal modification
 %%%===================================================================
 
-%% Simulates HTTP/2 SETTINGS frame - browsers send this immediately after handshake
-build_h2_settings() ->
-    %% SETTINGS frame: type=4, flags=0, stream_id=0
-    Settings = [
-        %% SETTINGS_HEADER_TABLE_SIZE (0x1) = 65536
-        <<16#00, 16#01, 16#00, 16#01, 16#00, 16#00>>,
-        %% SETTINGS_MAX_CONCURRENT_STREAMS (0x3) = 1000
-        <<16#00, 16#03, 16#00, 16#00, 16#03, 16#e8>>,
-        %% SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 6291456
-        <<16#00, 16#04, 16#00, 16#60, 16#00, 16#00>>,
-        %% SETTINGS_MAX_FRAME_SIZE (0x5) = 16384
-        <<16#00, 16#05, 16#00, 16#00, 16#40, 16#00>>
-    ],
-    Payload = iolist_to_binary(Settings),
-    Len = byte_size(Payload),
-    <<Len:?u24, 16#04, 16#00, 16#00, 16#00, 16#00, 16#00, Payload/binary>>.
+%% Generate OCSP response (smaller, more realistic)
+generate_ocsp_response() ->
+    <<0, 0, 0, 0>>.  %% Minimal OCSP staple
 
-%% Simulates HTTP/2 WINDOW_UPDATE frame
-build_h2_window_update(StreamId, Increment) ->
-    <<16#04:?u24, 16#08, 16#00, StreamId:32, Increment:32>>.
-
-%% Simulates HTTP/2 HEADERS frame (GET request pattern)
-build_h2_headers(StreamId) ->
-    %% HPACK encoded minimal headers (pre-built for common patterns)
-    HeadersPatterns = [
-        %% :method GET, :path /, :scheme https, :authority based
-        <<16#82, 16#86, 16#84, 16#41, 16#8c, 16#f1, 16#e3, 16#c2,
-          16#e5, 16#f2, 16#3a, 16#6b, 16#a0, 16#ab, 16#90, 16#f4,
-          16#ff>>,
-        %% Slightly different ordering
-        <<16#82, 16#84, 16#86, 16#41, 16#8c, 16#f1, 16#e3, 16#c2,
-          16#e5, 16#f2, 16#3a, 16#6b, 16#a0, 16#ab, 16#90, 16#f4,
-          16#ff, 16#00>>
-    ],
-    Headers = lists:nth(rand:uniform(length(HeadersPatterns)), HeadersPatterns),
-    PadLen = rand:uniform(16) - 1,
-    TotalLen = byte_size(Headers) + PadLen + 1,
-    Padding = rand:bytes(PadLen),
-    <<TotalLen:?u24, 16#01, 16#04, StreamId:32,
-      PadLen:8, Headers/binary, Padding/binary>>.
-
-%% HTTP/2 PING frame (browsers send this periodically)
-build_h2_ping() ->
-    PingData = crypto:strong_rand_bytes(8),
-    <<16#08:?u24, 16#06, 16#00, 16#00, 16#00, 16#00, 16#00, 16#00,
-      PingData/binary>>.
-
-%% HTTP/2 GOAWAY frame (for graceful connection end simulation)
-build_h2_goaway(LastStreamId) ->
-    AdditionalData = rand:bytes(rand:uniform(16)),
-    TotalLen = 8 + byte_size(AdditionalData),
-    <<TotalLen:?u24, 16#07, 16#00, 16#00, 16#00, 16#00, 16#00, 16#00,
-      LastStreamId:32, 0:32, AdditionalData/binary>>.
+%% Generate Session Ticket (realistic size)
+generate_session_ticket() ->
+    crypto:strong_rand_bytes(64 + rand:uniform(128)).
 
 %%%===================================================================
-%%% OCSP and Session Ticket generators
-%%%===================================================================
-
-generate_ocsp_response(_ServerDigest) ->
-    OcspStatus = 0,
-    ResponderId = crypto:strong_rand_bytes(20),
-    ProducedAt = erlang:system_time(second),
-    ThisUpdate = ProducedAt,
-    NextUpdate = ProducedAt + 604800,
-    CertId = crypto:strong_rand_bytes(36),
-    CertStatus = <<0>>,
-    SingleResponse = <<CertId/binary, CertStatus/binary,
-                        (encode_generalized_time(ThisUpdate))/binary,
-                        (encode_generalized_time(NextUpdate))/binary>>,
-    Responses = <<1:32, SingleResponse/binary>>,
-    ResponseData = <<0, ResponderId/binary,
-                     (encode_generalized_time(ProducedAt))/binary,
-                     Responses/binary>>,
-    Signature = crypto:strong_rand_bytes(256),
-    BasicOcspResponse = <<ResponseData/binary, 1:24, Signature/binary>>,
-    <<OcspStatus, (byte_size(BasicOcspResponse)):?u24, BasicOcspResponse/binary>>.
-
-encode_generalized_time(Timestamp) ->
-    {{Y, M, D}, {H, Mi, S}} = calendar:universal_time_to_local_time(
-        calendar:gregorian_seconds_to_datetime(Timestamp + 62167219200)
-    ),
-    Str = io_lib:format("~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ", [Y, M, D, H, Mi, S]),
-    list_to_binary(Str).
-
-generate_session_ticket(_Secret) ->
-    TicketAgeAdd = crypto:strong_rand_bytes(4),
-    TicketNonce = crypto:strong_rand_bytes(rand:uniform(16) + 16),
-    Ticket = crypto:strong_rand_bytes(rand:uniform(128) + 128),
-    TicketLifetime = 604800,
-    
-    <<TicketLifetime:32, TicketAgeAdd/binary,
-      (byte_size(TicketNonce)):8, TicketNonce/binary,
-      (byte_size(Ticket)):?u16, Ticket/binary,
-      0:?u16>>.
-
-%%%===================================================================
-%%% from_client_hello - Stealth version
+%%% from_client_hello - REALITY style
 %%%===================================================================
 
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -338,8 +183,6 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         extensions   = Extensions
     } = parse_client_hello(Data),
     
-    ?LOG_DEBUG("TLS ClientHello extensions: ~p", [Extensions]),
-
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
         {_, [{?EXT_SNI_HOST_NAME, Domain}]} -> Domain;
         _ ->
@@ -356,9 +199,6 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
     HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
-    
-    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p",
-               [HasSessionTicket, HasOcspStapling]),
 
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> =
@@ -373,18 +213,19 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     KeyShare = make_key_share(Extensions),
 
-    %% Generate Session Ticket
+    %% Generate Session Ticket if client supports it
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
-            Ticket = generate_session_ticket(Secret),
+            Ticket = generate_session_ticket(),
             TicketRec = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
             {Ticket, TicketRec};
         false ->
             {undefined, <<>>}
     end,
     
+    %% Generate OCSP response if client supports it
     OcspResponse = case HasOcspStapling of
-        true -> generate_ocsp_response(ServerDigest);
+        true -> generate_ocsp_response();
         false -> undefined
     end,
 
@@ -395,30 +236,36 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
     %% ================================================================
-    %% STEALTH: Realistic HTTP/2 initial frames (NOT random garbage)
-    %% Chrome sends these immediately after TLS handshake:
+    %% REALITY APPROACH: Minimal data after handshake
+    %% Just a single data record, like a normal web server
     %% ================================================================
     
-    H2Settings = build_h2_settings(),
-    H2WindowUpdate = build_h2_window_update(0, 15663105),
-    H2Headers = build_h2_headers(1),
-    
-    %% Construct realistic initial data sequence
-    %% Order matches what Chrome actually sends
-    DataFrames = [
-        as_tls_frame(?TLS_REC_DATA, H2Settings),
-        as_tls_frame(?TLS_REC_DATA, H2WindowUpdate),
-        TicketRecord,
-        as_tls_frame(?TLS_REC_DATA, H2Headers)
-    ],
+    %% Small realistic response (like a tiny web response)
+    RealisticData = case rand:uniform(3) of
+        1 -> <<"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n">>;
+        2 -> rand:bytes(rand:uniform(256));  %% Small binary response
+        3 -> <<>>  %% Empty (keep-alive probe)
+    end,
 
-    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), ChangeCipher | DataFrames],
+    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), 
+                 ChangeCipher,
+                 as_tls_frame(?TLS_REC_DATA, RealisticData) | 
+                 case TicketRecord of
+                     <<>> -> [];
+                     _ -> [TicketRecord]
+                 end],
 
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
                               HasSessionTicket, HasOcspStapling),
 
-    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), ChangeCipher | DataFrames],
+    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), 
+                ChangeCipher,
+                as_tls_frame(?TLS_REC_DATA, RealisticData) |
+                case TicketRecord of
+                    <<>> -> [];
+                    _ -> [TicketRecord]
+                end],
 
     Meta = #{
         session_id    => SessionId,
@@ -436,14 +283,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                                       true -> 604800;
                                       false -> undefined
                                   end,
-        lifecycle = ?LIFECYCLE_WARMUP,
-        packets_sent = 0,
-        lifecycle_change_at = rand:uniform(30) + 20,
-        stream_id = 3,
-        h2_settings_sent = true,
-        current_profile = random_tls_profile(),
-        last_send_time = erlang:system_time(microsecond),
-        inter_packet_gap_us = rand:uniform(5000) + 1000
+        packet_count = 0
     },
     
     {ok, Response, Meta, St}.
@@ -484,7 +324,7 @@ derive_sni_secret(BaseSecret, SniDomain, Salt)
     Derived.
 
 %%%===================================================================
-%%% ClientHello parser
+%%% ClientHello parser (unchanged)
 %%%===================================================================
 
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
@@ -573,188 +413,7 @@ make_srv_hello(Digest, SessionId, {Group, Key}, HasSessionTicket, HasOcspStaplin
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %%%===================================================================
-%%% Profile selection and helpers
-%%%===================================================================
-
-random_tls_profile() ->
-    Profiles = ?TLS_FINGERPRINT_PROFILES,
-    Profile = lists:nth(rand:uniform(length(Profiles)), Profiles),
-    ?LOG_DEBUG("Selected TLS fingerprint: ~s", [maps:get(name, Profile, unknown)]),
-    Profile.
-
-random_grease(Count) ->
-    [lists:nth(rand:uniform(length(?GREASE_VALUES)), ?GREASE_VALUES) || _ <- lists:seq(1, Count)].
-
-shuffle_list([]) -> [];
-shuffle_list(List) ->
-    Sorted = lists:sort([{rand:uniform(), X} || X <- List]),
-    [X || {_, X} <- Sorted].
-
-key_size_for_group(16#001D) -> 32;
-key_size_for_group(16#0017) -> 65;
-key_size_for_group(16#0018) -> 97;
-key_size_for_group(16#0019) -> 133;
-key_size_for_group(16#11EC) -> 1216;
-key_size_for_group(_) -> 32.
-
-%%%===================================================================
-%%% Extension builders
-%%%===================================================================
-
-build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Suites, GreaseVals),
-    
-    Final = case maps:get(cipher_order_randomized, Profile, false) of
-        true -> shuffle_list(WithGrease);
-        false -> WithGrease
-    end,
-    
-    << <<S:?u16>> || S <- Final >>.
-
-build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
-    
-    RealEntries = [
-        begin
-            KeySize = key_size_for_group(Group),
-            Key = crypto:strong_rand_bytes(KeySize),
-            <<Group:?u16, KeySize:?u16, Key/binary>>
-        end
-        || Group <- Groups
-    ],
-    
-    AllEntries = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, RealEntries, GreaseEntries),
-    
-    iolist_to_binary(AllEntries).
-
-build_supported_versions_ext(#{supported_versions := Versions,
-                                grease_count := {GreaseMin, GreaseMax}} = Profile) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Versions, GreaseVals),
-    
-    Final = case maps:get(version_order_randomized, Profile, false) of
-        true -> shuffle_list(WithGrease);
-        false -> WithGrease
-    end,
-    
-    << <<V:?u16>> || V <- Final >>.
-
-build_sig_algos(#{sig_algorithms_count := Count}) ->
-    AllAlgos = [
-        16#0403, 16#0503, 16#0603,
-        16#0203, 16#0804, 16#0805,
-        16#0806, 16#0401, 16#0501,
-        16#0601, 16#0201, 16#0402,
-        16#0302, 16#0202, 16#0301
-    ],
-    Selected = lists:sublist(AllAlgos, Count * 2),
-    Shuffled = shuffle_list(Selected),
-    AlgoListLen = Count * 2,
-    ExtLen = AlgoListLen + 2,
-    <<?EXT_SIGNATURE_ALGORITHMS:?u16,
-      ExtLen:?u16,
-      AlgoListLen:?u16,
-      << <<A:8>> || A <- Shuffled >>/binary>>.
-
-build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
-    PayloadSize = lists:nth(rand:uniform(length(Sizes)), Sizes),
-    EchRand1 = crypto:strong_rand_bytes(1),
-    EchRand32 = crypto:strong_rand_bytes(32),
-    EchPayload = crypto:strong_rand_bytes(PayloadSize),
-    EchContent =
-        <<16#00, 16#00, 16#01, 16#00, 16#01,
-          EchRand1/binary,
-          16#00, 16#20,
-          EchRand32/binary,
-          (byte_size(EchPayload)):?u16,
-          EchPayload/binary>>,
-    <<16#fe, 16#0d,
-      (byte_size(EchContent)):?u16,
-      EchContent/binary>>;
-build_ech(_) ->
-    <<>>.
-
-build_alpn(#{alpn_protocols := Protocols}) ->
-    Selected = lists:nth(rand:uniform(length(Protocols)), Protocols),
-    ProtocolEntries = << <<(byte_size(P)):8, P/binary>> || P <- Selected >>,
-    ProtocolsLen = byte_size(ProtocolEntries),
-    <<?EXT_ALPN:?u16,
-      (ProtocolsLen + 2):?u16,
-      ProtocolsLen:?u16,
-      ProtocolEntries/binary>>;
-build_alpn(_) ->
-    <<>>.
-
-build_ec_point_formats(#{ec_point_formats := true}) ->
-    <<?EXT_EC_POINT_FORMATS:?u16, 2:?u16, 1, 0>>;
-build_ec_point_formats(_) ->
-    <<>>.
-
-build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Groups, GreaseVals),
-    
-    GroupsBin = << <<G:?u16>> || G <- WithGrease >>,
-    GroupsLen = byte_size(GroupsBin),
-    <<?EXT_SUPPORTED_GROUPS:?u16,
-      (GroupsLen + 2):?u16,
-      GroupsLen:?u16,
-      GroupsBin/binary>>.
-
-build_padding(#{padding_size := {Min, Max}}) ->
-    PadSize = Min + rand:uniform(Max - Min + 1),
-    case PadSize of
-        0 -> <<>>;
-        _ ->
-            Padding = binary:copy(<<0>>, PadSize),
-            <<?EXT_PADDING:?u16, PadSize:?u16, Padding/binary>>
-    end;
-build_padding(_) ->
-    <<>>.
-
-build_session_ticket_ext(#{session_ticket_enabled := true}) ->
-    <<?EXT_SESSION_TICKET:?u16, 0:?u16>>;
-build_session_ticket_ext(_) ->
-    <<>>.
-
-build_ocsp_stapling_ext(#{ocsp_stapling_enabled := true}) ->
-    <<?EXT_STATUS_REQUEST:?u16, 0:?u16>>;
-build_ocsp_stapling_ext(_) ->
-    <<>>.
-
-make_sni(Domains) ->
-    Items = << <<?EXT_SNI_HOST_NAME, (byte_size(D)):?u16, D/binary>> || D <- Domains >>,
-    <<?EXT_SNI:?u16, (byte_size(Items)+2):?u16,
-      (byte_size(Items)):?u16, Items/binary>>.
-
-%%%===================================================================
-%%% ClientHello generator
+%%% ClientHello generator (minimal)
 %%%===================================================================
 
 -spec make_client_hello(binary(), binary()) -> binary().
@@ -769,80 +428,44 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain)
     make_client_hello(Timestamp, SessionId, mtp_handler:unhex(HexSecret), SniDomain);
 make_client_hello(Timestamp, SessionId, Secret, SniDomain)
   when byte_size(SessionId) =:= 32, byte_size(Secret) =:= 16 ->
-
-    Profile = random_tls_profile(),
-
-    CipherSuites = build_cipher_suites(Profile),
-    SNI = make_sni([SniDomain]),
-    SigAlgos = build_sig_algos(Profile),
-    SupportedGroups = build_supported_groups(Profile),
     
-    SupportedVersionsExt = build_supported_versions_ext(Profile),
-    VersionsLen = byte_size(SupportedVersionsExt),
-    SupportedVersions =
-        <<?EXT_SUPPORTED_VERSIONS:?u16,
-          (VersionsLen + 1):?u16,
-          VersionsLen,
-          SupportedVersionsExt/binary>>,
-
-    KeyShareEntries = build_key_share_entries(Profile),
-    KSListLen = byte_size(KeyShareEntries),
-    KeyShare =
-        <<?EXT_KEY_SHARE:?u16,
-          (KSListLen + 2):?u16,
-          KSListLen:?u16,
-          KeyShareEntries/binary>>,
-
-    ECH = build_ech(Profile),
-    ALPN = build_alpn(Profile),
-    EcPointExt = build_ec_point_formats(Profile),
-    SessionTicketExt = build_session_ticket_ext(Profile),
-    OcspStaplingExt = build_ocsp_stapling_ext(Profile),
-    PaddingExt = build_padding(Profile),
-
-    ExtensionsBase = [
-        ECH,
-        SessionTicketExt,
-        EcPointExt,
-        <<16#44, 16#cd, 16#00, 16#05,
-          16#00, 16#03, 16#02, $h, $2>>,
-        KeyShare,
-        <<16#00, 16#12, 0:16>>,
-        SupportedGroups,
-        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,
-        SigAlgos,
-        OcspStaplingExt,
-        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>,
-        ALPN,
-        SNI,
-        SupportedVersions,
-        PaddingExt
-    ],
-
-    NonEmpty = [E || E <- ExtensionsBase, E =/= <<>>],
-    Extensions = case maps:get(extensions_order_randomized, Profile, false) of
-        true -> shuffle_list(NonEmpty);
-        false -> NonEmpty
-    end,
-
+    %% Minimal extensions - just what's needed
+    SNI = <<?EXT_SNI:?u16, (byte_size(SniDomain) + 5):?u16,
+            (byte_size(SniDomain) + 3):?u16,
+            ?EXT_SNI_HOST_NAME, (byte_size(SniDomain)):?u16, SniDomain/binary>>,
+    
+    KeyShare = <<?EXT_KEY_SHARE:?u16, 38:?u16, 36:?u16,
+                 16#00, 16#1d, 0, 32, (crypto:strong_rand_bytes(32))/binary>>,
+    
+    SupportedVersions = <<?EXT_SUPPORTED_VERSIONS:?u16, 3:?u16, 2, ?TLS_13_VERSION>>,
+    
+    SessionTicket = <<?EXT_SESSION_TICKET:?u16, 0:?u16>>,
+    
+    Extensions = [SNI, KeyShare, SupportedVersions, SessionTicket],
     ExtBin = iolist_to_binary(Extensions),
-    CSLen = byte_size(CipherSuites),
-    SessIdLen = byte_size(SessionId),
+    
+    %% Minimal cipher suites (just TLS 1.3)
+    CipherSuites = <<16#13, 16#01,   %% TLS_AES_128_GCM_SHA256
+                     16#13, 16#02,   %% TLS_AES_256_GCM_SHA384
+                     16#13, 16#03>>, %% TLS_CHACHA20_POLY1305_SHA256
+    CSLen = 6,
+    
+    SessIdLen = 32,
     ExtLen = byte_size(ExtBin),
-
+    
     HelloBodyLen = 2 + 32 + 1 + SessIdLen + 2 + CSLen + 1 + 1 + 2 + ExtLen,
     TlsLen = HelloBodyLen + 4,
-
+    
     Pack = fun(FakeRandom) ->
         <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
           ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
-          FakeRandom:?DIGEST_LEN/binary,
-          SessIdLen, SessionId/binary,
+          FakeRandom:32/binary,
+          SessIdLen, SessionId:32/binary,
           CSLen:?u16, CipherSuites/binary,
           1, 0,
           ExtLen:?u16, ExtBin/binary>>
     end,
-
+    
     Hello0     = Pack(binary:copy(<<0>>, ?DIGEST_LEN)),
     Digest     = hmac(sha256, Secret, Hello0),
     EncTs      = <<0:(?DIGEST_LEN - 4)/unit:8, Timestamp:32/unsigned-little>>,
@@ -861,20 +484,10 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
                      Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
-                     Handshake:HSLen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16,
-                     ChangeCipher:CCLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16,
-                     Data:DLen/binary,
-                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16,
-                     _Ticket:TicketLen/binary,
-                     Tail/binary>>) ->
-    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
 parse_server_hello(<<16#16, _/binary>> = B) ->
-    case tls_records_complete(B, 4) of
+    case tls_records_complete(B, 3) of
         true  -> {error, tls_domain_forwarding};
         false -> incomplete
     end;
@@ -892,23 +505,13 @@ tls_records_complete(_B, _N) ->
     false.
 
 %%%===================================================================
-%%% Data stream codec - Stealth version
+%%% Data stream codec - Minimal, like real TLS
 %%%===================================================================
 
 -spec new() -> codec().
 new() ->
     #st{
-        session_ticket = undefined,
-        ocsp_response = undefined,
-        session_ticket_lifetime = undefined,
-        lifecycle = ?LIFECYCLE_STEADY,
-        packets_sent = 0,
-        lifecycle_change_at = rand:uniform(50) + 30,
-        stream_id = 1,
-        h2_settings_sent = false,
-        current_profile = random_tls_profile(),
-        last_send_time = erlang:system_time(microsecond),
-        inter_packet_gap_us = rand:uniform(5000) + 1000
+        packet_count = 0
     }.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
@@ -916,9 +519,6 @@ new() ->
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
-                    _Data:Size/binary, Tail/binary>>, St) ->
-    try_decode_packet(Tail, St);
-try_decode_packet(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
 try_decode_packet(Bin, St) when byte_size(Bin) =< (?MAX_IN_PACKET_SIZE + 5) ->
@@ -938,114 +538,11 @@ decode_all(Bin, Acc, St0) ->
             decode_all(Tail, <<Acc/binary, Data/binary>>, St)
     end.
 
-%%%===================================================================
-%%% STEALTH encode_packet - Realistic traffic patterns
-%%%===================================================================
-
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, #st{
-    lifecycle = Lifecycle,
-    packets_sent = PacketsSent,
-    lifecycle_change_at = LifecycleChangeAt,
-    stream_id = StreamId,
-    h2_settings_sent = H2SettingsSent,
-    inter_packet_gap_us = GapUs
-} = St) ->
-    
-    %% ================================================================
-    %% Lifecycle Management (Realistic connection behavior)
-    %% ================================================================
-    
-    {NewLifecycle, NewChangeAt} = 
-        if
-            PacketsSent >= LifecycleChangeAt ->
-                NewLc = case Lifecycle of
-                    ?LIFECYCLE_WARMUP -> ?LIFECYCLE_STEADY;
-                    ?LIFECYCLE_STEADY ->
-                        case rand:uniform(5) of
-                            1 -> ?LIFECYCLE_BURST;
-                            _ -> ?LIFECYCLE_STEADY
-                        end;
-                    ?LIFECYCLE_BURST -> ?LIFECYCLE_STEADY
-                end,
-                {NewLc, PacketsSent + rand:uniform(40) + 20};
-            true ->
-                {Lifecycle, LifecycleChangeAt}
-        end,
-    
-    %% ================================================================
-    %% Build realistic TLS records based on lifecycle
-    %% ================================================================
-    
-    {TlsFrames, NewStreamId, NewH2Sent, NewGapUs} = 
-        case NewLifecycle of
-            ?LIFECYCLE_WARMUP ->
-                %% Warm-up: Send HTTP/2 overhead (SETTINGS, WINDOW_UPDATE)
-                SettingFrame = case H2SettingsSent of
-                    false -> [as_tls_data_frame(build_h2_settings())];
-                    true -> []
-                end,
-                WUFrames = case rand:uniform(3) of
-                    1 -> [as_tls_data_frame(build_h2_window_update(0, 15663105)),
-                          as_tls_data_frame(build_h2_window_update(StreamId, rand:uniform(65535)))];
-                    _ -> []
-                end,
-                PingFrames = case rand:uniform(4) of
-                    1 -> [as_tls_data_frame(build_h2_ping())];
-                    _ -> []
-                end,
-                {SettingFrame ++ WUFrames ++ PingFrames, StreamId + 2, true, 
-                 GapUs + rand:uniform(3000) - 1500};
-            
-            ?LIFECYCLE_STEADY ->
-                %% Steady: Mostly real data, occasional HTTP/2 overhead
-                RealData = as_tls_data_frame(Bin),
-                ExtraFrames = case rand:uniform(8) of
-                    1 -> [as_tls_data_frame(build_h2_ping())];
-                    2 -> [as_tls_data_frame(build_h2_window_update(StreamId, rand:uniform(1048576)))];
-                    _ -> []
-                end,
-                {[RealData | ExtraFrames], StreamId, H2SettingsSent,
-                 GapUs + rand:uniform(2000) - 1000};
-            
-            ?LIFECYCLE_BURST ->
-                %% Burst: Like loading a page - multiple streams, larger windows
-                BurstStreamId = StreamId + 2,
-                RealData = as_tls_data_frame(Bin),
-                H2Headers1 = as_tls_data_frame(build_h2_headers(BurstStreamId)),
-                H2Headers2 = as_tls_data_frame(build_h2_headers(BurstStreamId + 2)),
-                H2Window = as_tls_data_frame(build_h2_window_update(0, 15728640)),
-                {[RealData, H2Headers1, H2Headers2, H2Window], 
-                 BurstStreamId + 4, H2SettingsSent,
-                 GapUs + rand:uniform(1000) - 500}
-        end,
-    
-    %% ================================================================
-    %% Add data frame with actual payload (always)
-    %% ================================================================
-    
-    FinalFrames = case NewLifecycle of
-        ?LIFECYCLE_STEADY -> TlsFrames;  %% Already includes real data
-        _ -> [as_tls_data_frame(Bin) | TlsFrames]  %% Prepend real data
-    end,
-    
-    %% ================================================================
-    %% Calculate realistic inter-packet timing (microseconds)
-    %% ================================================================
-    
-    FinalGapUs = max(100, min(50000, NewGapUs)),
-    
-    NewSt = St#st{
-        lifecycle = NewLifecycle,
-        packets_sent = PacketsSent + 1,
-        lifecycle_change_at = NewChangeAt,
-        stream_id = NewStreamId,
-        h2_settings_sent = NewH2Sent,
-        last_send_time = erlang:system_time(microsecond),
-        inter_packet_gap_us = FinalGapUs
-    },
-    
-    {FinalFrames, NewSt}.
+encode_packet(Bin, St) ->
+    NewCount = St#st.packet_count + 1,
+    NewSt = St#st{packet_count = NewCount},
+    {as_tls_data_frame(Bin), NewSt}.
 
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).

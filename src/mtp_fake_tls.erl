@@ -1,6 +1,5 @@
 %%%===================================================================
-%%% Fake TLS - Working version + Hidden Certificate
-%%% Strategy: Certificate hidden as Application Data
+%%% Fake TLS - Working version + Hidden Certificate + Session Ticket
 %%%===================================================================
 
 -module(mtp_fake_tls).
@@ -141,14 +140,18 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% Fake certificate builder (hidden as App Data)
+%%% Fake TLS data builders
 %%%===================================================================
 
 build_fake_certificate_data() ->
-    %% This looks like TLS 1.3 Certificate + CertificateVerify + Finished
-    %% But it's wrapped as Application Data so client ignores it
+    %% Looks like TLS 1.3 Certificate + CertificateVerify
     CertSize = 600 + rand:uniform(400),
     crypto:strong_rand_bytes(CertSize).
+
+build_fake_session_ticket_data() ->
+    %% Looks like TLS 1.3 NewSessionTicket
+    TicketSize = 128 + rand:uniform(128),
+    crypto:strong_rand_bytes(TicketSize).
 
 %%%===================================================================
 %%% from_client_hello (server side)
@@ -194,8 +197,9 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     FakeDataSize = 96 + rand:uniform(400),
     FakeHttpData = crypto:strong_rand_bytes(FakeDataSize),
     
-    %% Hidden certificate as additional App Data
+    %% Hidden TLS 1.3 messages as App Data
     FakeCert = build_fake_certificate_data(),
+    FakeTicket = build_fake_session_ticket_data(),
 
     %% Temporary ServerHello for HMAC
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN),
@@ -203,25 +207,41 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
-    %% Randomize order (30% chance)
-    {CcFrame, DataFrames} = case rand:uniform(10) of
-        N when N =< 3 ->
-            %% Certificate first, then ChangeCipher, then data
-            {ChangeCipher, [
-                as_tls_frame(?TLS_REC_DATA, FakeCert),
-                as_tls_frame(?TLS_REC_DATA, FakeHttpData)
-            ]};
-        _ ->
-            %% Normal order: ChangeCipher then mixed data
-            {ChangeCipher, [
+    %% Mix order randomly (like real TLS 1.3)
+    DataFrames = case rand:uniform(4) of
+        1 ->
+            %% Order 1: HTTP data, Certificate, Ticket
+            [
                 as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+                as_tls_frame(?TLS_REC_DATA, FakeCert),
+                as_tls_frame(?TLS_REC_DATA, FakeTicket)
+            ];
+        2 ->
+            %% Order 2: Certificate, HTTP data, Ticket
+            [
+                as_tls_frame(?TLS_REC_DATA, FakeCert),
+                as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+                as_tls_frame(?TLS_REC_DATA, FakeTicket)
+            ];
+        3 ->
+            %% Order 3: HTTP data, Ticket, Certificate
+            [
+                as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+                as_tls_frame(?TLS_REC_DATA, FakeTicket),
                 as_tls_frame(?TLS_REC_DATA, FakeCert)
-            ]}
+            ];
+        4 ->
+            %% Order 4: Certificate, Ticket, HTTP data
+            [
+                as_tls_frame(?TLS_REC_DATA, FakeCert),
+                as_tls_frame(?TLS_REC_DATA, FakeTicket),
+                as_tls_frame(?TLS_REC_DATA, FakeHttpData)
+            ]
     end,
 
     Response0 = [
         as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-        CcFrame
+        ChangeCipher
     ] ++ DataFrames,
 
     %% Real ServerHello digest
@@ -230,7 +250,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     Response = [
         as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-        CcFrame
+        ChangeCipher
     ] ++ DataFrames,
 
     Meta = #{

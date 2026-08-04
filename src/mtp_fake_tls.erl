@@ -1,5 +1,15 @@
 %%%===================================================================
-%%% Fake TLS - STEALTH TIMING (Reality + Anti-Timing-Analysis)
+%%% Fake TLS - REALITY Advanced v3.0 (Final Production Release)
+%%%===================================================================
+%%% Combines the best of both worlds:
+%%% - REALITY-style authentication via Random field (from v1)
+%%% - Deep fingerprint randomization with browser profiles (from v2)
+%%% - GREASE techniques for maximum evasion
+%%% - Domain allow-listing and SNI derivation
+%%% - Advanced timing attack mitigation (NEW in v3)
+%%% - Adaptive behavior patterns (NEW in v3)
+%%% - HTTP/2 fingerprinting (NEW in v3)
+%%% - Memory optimization and caching (NEW in v3)
 %%%===================================================================
 
 -module(mtp_fake_tls).
@@ -35,25 +45,10 @@
     session_ticket :: binary() | undefined,
     ocsp_response :: binary() | undefined,
     session_ticket_lifetime :: non_neg_integer() | undefined,
-    
-    %% Packet counting for lifecycle simulation
     packet_count = 0 :: non_neg_integer(),
-    
-    %% Timing simulation state
-    lifecycle = steady :: warmup | steady | burst | idle,
-    lifecycle_change_at = 0 :: non_neg_integer(),
-    burst_remaining = 0 :: non_neg_integer(),
-    
-    %% Padding randomization
-    padding_enabled = true :: boolean(),
-    pad_min = 0 :: non_neg_integer(),
-    pad_max = 256 :: non_neg_integer(),
-    
-    %% Last send time for gap calculation
-    last_send_time = 0 :: non_neg_integer(),
-    
-    %% Connection start for lifecycle management
-    connection_start_time = 0 :: non_neg_integer()
+    profile_name :: atom() | undefined,
+    timing_profile :: map() | undefined,  %% NEW: Timing behavior profile
+    connection_start :: non_neg_integer() | undefined  %% NEW: Start timestamp
 }).
 
 -record(client_hello, {
@@ -109,32 +104,242 @@
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
 -define(EXT_KEY_SHARE,          51).
+-define(EXT_ENCRYPTED_CLIENT_HELLO, 16#fe0d).
 
 %%%===================================================================
-%%% Timing Constants (milliseconds)
+%%% GREASE Values (RFC 8701)
 %%%===================================================================
 
-%% Normal web browsing inter-packet gaps
--define(GAP_STEADY_MIN, 50).
--define(GAP_STEADY_MAX, 500).
+-define(GREASE_VALUES, [
+    16#0a0a, 16#1a1a, 16#2a2a, 16#3a3a, 16#4a4a,
+    16#5a5a, 16#6a6a, 16#7a7a, 16#8a8a, 16#9a9a,
+    16#aaaa, 16#baba, 16#caca, 16#dada, 16#eaea,
+    16#fafa
+]).
 
-%% Warm-up phase (initial page load) - faster packets
--define(GAP_WARMUP_MIN, 10).
--define(GAP_WARMUP_MAX, 100).
+%%%===================================================================
+%%% Timing Profiles (NEW)
+%%%===================================================================
 
-%% Burst phase (loading new page/resource) - very fast
--define(GAP_BURST_MIN, 5).
--define(GAP_BURST_MAX, 50).
+-define(TIMING_PROFILES, [
+    #{name => normal_network,
+      processing_jitter_ms => {5, 25},
+      packet_spacing_ms => {1, 10},
+      burst_probability => 0.15,
+      burst_size => {2, 5},
+      initial_delay_ms => {0, 50}
+    },
+    #{name => congested_network,
+      processing_jitter_ms => {10, 50},
+      packet_spacing_ms => {5, 30},
+      burst_probability => 0.05,
+      burst_size => {1, 3},
+      initial_delay_ms => {20, 100}
+    },
+    #{name => high_quality_network,
+      processing_jitter_ms => {1, 10},
+      packet_spacing_ms => {0, 5},
+      burst_probability => 0.3,
+      burst_size => {3, 8},
+      initial_delay_ms => {0, 20}
+    }
+]).
 
-%% Idle phase (user reading) - long pauses
--define(GAP_IDLE_MIN, 5000).
--define(GAP_IDLE_MAX, 30000).
+%%%===================================================================
+%%% Browser Fingerprint Profiles
+%%%===================================================================
 
-%% Lifecycle transition probabilities (per packet)
--define(PROB_STEADY_TO_BURST, 0.05).    %% 5% chance to burst
--define(PROB_STEADY_TO_IDLE, 0.02).     %% 2% chance to idle
--define(PROB_BURST_TO_STEADY, 0.3).     %% 30% chance to end burst
--define(PROB_IDLE_TO_STEADY, 0.1).      %% 10% chance to wake up
+-define(TLS_FINGERPRINT_PROFILES, [
+    #{name => chrome_120,
+      cipher_suites => [
+          16#13, 16#01,   % TLS_AES_128_GCM_SHA256
+          16#13, 16#02,   % TLS_AES_256_GCM_SHA384
+          16#13, 16#03,   % TLS_CHACHA20_POLY1305_SHA256
+          16#c0, 16#2b,   % ECDHE_ECDSA_AES128_GCM_SHA256
+          16#c0, 16#2f,   % ECDHE_RSA_AES128_GCM_SHA256
+          16#c0, 16#2c,   % ECDHE_ECDSA_AES256_GCM_SHA384
+          16#c0, 16#30,   % ECDHE_RSA_AES256_GCM_SHA384
+          16#cc, 16#a9,   % ECDHE_ECDSA_CHACHA20_POLY1305
+          16#cc, 16#a8,   % ECDHE_RSA_CHACHA20_POLY1305
+          16#c0, 16#13,   % ECDHE_RSA_AES128_CBC_SHA
+          16#c0, 16#14,   % ECDHE_RSA_AES256_CBC_SHA
+          16#00, 16#9c,   % RSA_AES128_GCM_SHA256
+          16#00, 16#9d,   % RSA_AES256_GCM_SHA384
+          16#00, 16#2f,   % RSA_AES128_CBC_SHA
+          16#00, 16#35    % RSA_AES256_CBC_SHA
+      ],
+      cipher_order_randomized => true,
+      grease_count => {2, 4},
+      key_share_groups => [
+          16#11, 16#ec,   % X25519MLKEM768
+          16#00, 16#1d,   % x25519
+          16#00, 16#17,   % secp256r1
+          16#00, 16#18    % secp384r1
+      ],
+      supported_versions => [
+          16#03, 16#04,   % TLS 1.3
+          16#03, 16#03    % TLS 1.2
+      ],
+      version_order_randomized => true,
+      sig_algorithms_count => 15,
+      ec_point_formats => true,
+      compress_certificate => brotli,
+      ech_payload_size => [176, 208, 240],
+      session_id_length => {32, 32},
+      extensions_order_randomized => true,
+      alpn_protocols => [
+          [<<"h2">>, <<"http/1.1">>],
+          [<<"h2">>],
+          [<<"http/1.1">>]
+      ],
+      padding_size => {0, 512},
+      http2_settings => #{  %% NEW: HTTP/2 fingerprint
+          initial_window_size => 65535,
+          max_frame_size => 16384,
+          max_concurrent_streams => 256,
+          header_table_size => 65536
+      }
+    },
+    #{name => firefox_121,
+      cipher_suites => [
+          16#13, 16#01,
+          16#13, 16#02,
+          16#13, 16#03,
+          16#c0, 16#2b,
+          16#c0, 16#2f,
+          16#c0, 16#2c,
+          16#c0, 16#30,
+          16#cc, 16#a9,
+          16#cc, 16#a8,
+          16#c0, 16#13,
+          16#c0, 16#14,
+          16#00, 16#9c,
+          16#00, 16#9d,
+          16#00, 16#2f,
+          16#00, 16#35,
+          16#00, 16#3c,
+          16#00, 16#3d
+      ],
+      cipher_order_randomized => true,
+      grease_count => {2, 3},
+      key_share_groups => [
+          16#00, 16#1d,
+          16#00, 16#17
+      ],
+      supported_versions => [
+          16#03, 16#04,
+          16#03, 16#03
+      ],
+      version_order_randomized => false,
+      sig_algorithms_count => 17,
+      ec_point_formats => true,
+      compress_certificate => brotli,
+      ech_payload_size => [144, 176],
+      session_id_length => {32, 32},
+      extensions_order_randomized => false,
+      alpn_protocols => [
+          [<<"h2">>, <<"http/1.1">>]
+      ],
+      padding_size => {0, 256},
+      http2_settings => #{
+          initial_window_size => 131072,
+          max_frame_size => 16384,
+          max_concurrent_streams => 128,
+          header_table_size => 65536
+      }
+    },
+    #{name => safari_17,
+      cipher_suites => [
+          16#13, 16#01,
+          16#13, 16#02,
+          16#13, 16#03,
+          16#c0, 16#2b,
+          16#c0, 16#2f,
+          16#c0, 16#2c,
+          16#c0, 16#30,
+          16#cc, 16#a9,
+          16#cc, 16#a8,
+          16#c0, 16#13,
+          16#c0, 16#14
+      ],
+      cipher_order_randomized => false,
+      grease_count => {2, 4},
+      key_share_groups => [
+          16#00, 16#1d,
+          16#00, 16#17,
+          16#00, 16#18,
+          16#00, 16#19
+      ],
+      supported_versions => [
+          16#03, 16#04
+      ],
+      version_order_randomized => false,
+      sig_algorithms_count => 13,
+      ec_point_formats => false,
+      compress_certificate => none,
+      ech_payload_size => [208, 240],
+      session_id_length => {32, 32},
+      extensions_order_randomized => false,
+      alpn_protocols => [
+          [<<"h2">>, <<"http/1.1">>]
+      ],
+      padding_size => {0, 512},
+      http2_settings => #{
+          initial_window_size => 65535,
+          max_frame_size => 16384,
+          max_concurrent_streams => 100,
+          header_table_size => 4096
+      }
+    },
+    #{name => edge_120,
+      cipher_suites => [
+          16#13, 16#01,
+          16#13, 16#02,
+          16#13, 16#03,
+          16#c0, 16#2b,
+          16#c0, 16#2f,
+          16#c0, 16#2c,
+          16#c0, 16#30,
+          16#cc, 16#a9,
+          16#cc, 16#a8,
+          16#c0, 16#13,
+          16#c0, 16#14,
+          16#00, 16#9c,
+          16#00, 16#9d,
+          16#00, 16#2f,
+          16#00, 16#35
+      ],
+      cipher_order_randomized => true,
+      grease_count => {2, 4},
+      key_share_groups => [
+          16#11, 16#ec,
+          16#00, 16#1d,
+          16#00, 16#17
+      ],
+      supported_versions => [
+          16#03, 16#04,
+          16#03, 16#03
+      ],
+      version_order_randomized => true,
+      sig_algorithms_count => 16,
+      ec_point_formats => true,
+      compress_certificate => brotli,
+      ech_payload_size => [176, 208],
+      session_id_length => {32, 32},
+      extensions_order_randomized => true,
+      alpn_protocols => [
+          [<<"h2">>, <<"http/1.1">>],
+          [<<"h2">>]
+      ],
+      padding_size => {0, 512},
+      http2_settings => #{
+          initial_window_size => 65535,
+          max_frame_size => 16384,
+          max_concurrent_streams => 256,
+          header_table_size => 65536
+      }
+    }
+]).
 
 %%%===================================================================
 %%% Types
@@ -148,8 +353,17 @@
     client_digest  := binary(),
     sni_domain     => binary(),
     session_ticket => binary() | undefined,
-    ocsp_response  => binary() | undefined
+    ocsp_response  => binary() | undefined,
+    profile_name   => atom(),
+    timing_profile => map()  %% NEW
 }.
+
+%%%===================================================================
+%%% ETS Cache Tables (NEW)
+%%%===================================================================
+
+-define(PROFILE_CACHE, mtp_tls_profile_cache).
+-define(TIMING_CACHE, mtp_tls_timing_cache).
 
 %%%===================================================================
 %%% Secret helpers
@@ -195,6 +409,146 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
+%%% Utility Functions
+%%%===================================================================
+
+-spec shuffle_list(list()) -> list().
+shuffle_list([]) -> [];
+shuffle_list(List) ->
+    Sorted = lists:sort([{rand:uniform(), X} || X <- List]),
+    [X || {_, X} <- Sorted].
+
+-spec random_grease(non_neg_integer()) -> [non_neg_integer()].
+random_grease(Count) ->
+    [lists:nth(rand:uniform(length(?GREASE_VALUES)), ?GREASE_VALUES) || _ <- lists:seq(1, Count)].
+
+%%%===================================================================
+%%% Profile Caching System (NEW)
+%%%===================================================================
+
+-spec init_caches() -> ok.
+init_caches() ->
+    case ets:info(?PROFILE_CACHE) of
+        undefined ->
+            ets:new(?PROFILE_CACHE, [named_table, set, public,
+                                     {read_concurrency, true},
+                                     {write_concurrency, true}]);
+        _ -> ok
+    end,
+    case ets:info(?TIMING_CACHE) of
+        undefined ->
+            ets:new(?TIMING_CACHE, [named_table, set, public,
+                                    {read_concurrency, true},
+                                    {write_concurrency, true}]);
+        _ -> ok
+    end.
+
+-spec random_tls_profile() -> map().
+random_tls_profile() ->
+    init_caches(),
+    case rand:uniform(10) of
+        N when N =< 7 ->  %% 70% cache hit
+            case ets:lookup(?PROFILE_CACHE, last_profile) of
+                [{last_profile, Profile}] -> 
+                    ?LOG_DEBUG("Using cached profile: ~s", [maps:get(name, Profile, unknown)]),
+                    Profile;
+                [] -> select_and_cache_profile()
+            end;
+        _ ->  %% 30% fresh profile for diversity
+            select_and_cache_profile()
+    end.
+
+-spec select_and_cache_profile() -> map().
+select_and_cache_profile() ->
+    Profiles = ?TLS_FINGERPRINT_PROFILES,
+    Profile = lists:nth(rand:uniform(length(Profiles)), Profiles),
+    ets:insert(?PROFILE_CACHE, {last_profile, Profile}),
+    ?LOG_DEBUG("Selected new TLS fingerprint: ~s", [maps:get(name, Profile, unknown)]),
+    Profile.
+
+%%%===================================================================
+%%% Timing Attack Mitigation (NEW)
+%%%===================================================================
+
+-spec random_timing_profile() -> map().
+random_timing_profile() ->
+    TimingProfiles = ?TIMING_PROFILES,
+    lists:nth(rand:uniform(length(TimingProfiles)), TimingProfiles).
+
+-spec apply_processing_jitter(map()) -> ok.
+apply_processing_jitter(#{processing_jitter_ms := {Min, Max}}) ->
+    Jitter = Min + rand:uniform(Max - Min + 1),
+    timer:sleep(Jitter);
+apply_processing_jitter(_) ->
+    timer:sleep(rand:uniform(20)).
+
+-spec apply_packet_spacing(map(), non_neg_integer()) -> ok.
+apply_packet_spacing(#{packet_spacing_ms := {Min, Max}}, PacketCount) ->
+    case PacketCount > 1 of
+        true ->
+            Space = Min + rand:uniform(Max - Min + 1),
+            timer:sleep(Space);
+        false -> ok
+    end;
+apply_packet_spacing(_, _) -> ok.
+
+-spec should_burst_packets(map()) -> boolean().
+should_burst_packets(#{burst_probability := Prob}) ->
+    rand:uniform() < Prob;
+should_burst_packets(_) -> false.
+
+-spec get_burst_size(map()) -> non_neg_integer().
+get_burst_size(#{burst_size := {Min, Max}}) ->
+    Min + rand:uniform(Max - Min + 1);
+get_burst_size(_) -> 1.
+
+-spec apply_initial_connection_delay(map()) -> ok.
+apply_initial_connection_delay(#{initial_delay_ms := {Min, Max}}) ->
+    Delay = Min + rand:uniform(Max - Min + 1),
+    timer:sleep(Delay);
+apply_initial_connection_delay(_) -> ok.
+
+%%%===================================================================
+%%% Adaptive Timing Behavior (NEW)
+%%%===================================================================
+
+-spec generate_timing_behavior(binary(), map()) -> map().
+generate_timing_behavior(ClientDigest, TimingProfile) ->
+    %% Use client digest to seed consistent timing behavior
+    <<Seed:32, _/binary>> = crypto:hash(sha256, ClientDigest),
+    _ = rand:seed(exsplus, {Seed, Seed + 1, Seed + 2}),
+    
+    %% Create session-specific timing variations
+    #{
+        initial_jitter => rand:uniform(100),
+        packet_multiplier => 0.5 + rand:uniform() * 1.5,
+        delay_pattern => random_delay_pattern(),
+        burst_trigger => rand:uniform(10)
+    }.
+
+-spec random_delay_pattern() -> [non_neg_integer()].
+random_delay_pattern() ->
+    PatternType = rand:uniform(4),
+    case PatternType of
+        1 -> [1, 2, 5, 3, 1, 4, 2, 3, 1, 5];  %% Normal variation
+        2 -> [1, 1, 1, 8, 1, 1, 2, 1, 1, 4];  %% Occasional spikes
+        3 -> [2, 3, 2, 1, 2, 3, 1, 2, 3, 2];  %% Regular pattern
+        4 -> [1, 3, 2, 4, 1, 5, 2, 3, 1, 2]   %% Mixed pattern
+    end.
+
+%%%===================================================================
+%%% Key size helpers
+%%%===================================================================
+
+-spec key_size_for_group(non_neg_integer()) -> non_neg_integer().
+key_size_for_group(16#001D) -> 32;    % x25519
+key_size_for_group(16#0017) -> 65;    % secp256r1 (uncompressed)
+key_size_for_group(16#0018) -> 97;    % secp384r1
+key_size_for_group(16#0019) -> 133;   % secp521r1
+key_size_for_group(16#11EC) -> 1216;  % X25519MLKEM768
+key_size_for_group(_) -> 32.
+
+%%%===================================================================
 %%% OCSP and Session Ticket helpers
 %%%===================================================================
 
@@ -205,7 +559,7 @@ generate_session_ticket() ->
     crypto:strong_rand_bytes(64 + rand:uniform(128)).
 
 %%%===================================================================
-%%% from_client_hello
+%%% ClientHello parsing and validation (REALITY-style)
 %%%===================================================================
 
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -217,6 +571,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         extensions   = Extensions
     } = parse_client_hello(Data),
 
+    %% Extract SNI domain
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
         {_, [{?EXT_SNI_HOST_NAME, Domain}]} -> Domain;
         _ ->
@@ -224,6 +579,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             error({protocol_error, tls_no_sni})
     end,
 
+    %% Check domain allow-list
     case is_domain_allowed(SniDomain, AllowedDomains) of
         true  -> ok;
         false ->
@@ -231,9 +587,11 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             error({protocol_error, tls_domain_not_allowed, SniDomain})
     end,
 
+    %% Detect client profile from extensions for consistent behavior
     HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
     HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
 
+    %% REALITY-style authentication: verify secret in Random field
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> =
         crypto:exor(ClientDigest, ServerDigest),
@@ -245,8 +603,10 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     abs(CurrentTime - Timestamp) =< 300
         orelse error({protocol_error, tls_timestamp_expired}),
 
+    %% Extract key share from client
     KeyShare = make_key_share(Extensions),
 
+    %% Generate session ticket if client supports it
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
             Ticket = generate_session_ticket(),
@@ -256,23 +616,40 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             {undefined, <<>>}
     end,
 
+    %% Generate OCSP response if client supports it
     OcspResponse = case HasOcspStapling of
         true -> generate_ocsp_response();
         false -> undefined
     end,
 
+    %% Select a random profile for response behavior
+    Profile = random_tls_profile(),
+    ProfileName = maps:get(name, Profile),
+
+    %% Select timing profile (NEW)
+    TimingProfile = random_timing_profile(),
+    apply_initial_connection_delay(TimingProfile),
+    
+    %% Generate timing behavior based on client (NEW)
+    TimingBehavior = generate_timing_behavior(ClientDigest, TimingProfile),
+
+    %% Build ServerHello with random digest placeholder
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN),
                                SessionId, KeyShare,
                                HasSessionTicket, HasOcspStapling),
 
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
-    RealisticData = case rand:uniform(3) of
+    %% Randomize post-handshake data size for realism
+    RealisticData = case rand:uniform(5) of
         1 -> <<"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n">>;
-        2 -> crypto:strong_rand_bytes(rand:uniform(256));
-        3 -> <<>>
+        2 -> <<"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello World!">>;
+        3 -> crypto:strong_rand_bytes(rand:uniform(512));
+        4 -> <<"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n">>;
+        5 -> <<>>
     end,
 
+    %% Build response to compute digest
     Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
                  ChangeCipher,
                  as_tls_frame(?TLS_REC_DATA, RealisticData) |
@@ -281,9 +658,16 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                      _ -> [TicketRecord]
                  end],
 
+    %% Apply processing jitter before computation (NEW)
+    apply_processing_jitter(TimingProfile),
+
+    %% Compute REALITY-style digest for ServerHello
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
                               HasSessionTicket, HasOcspStapling),
+
+    %% Final response with HTTP/2 settings if applicable (NEW)
+    Http2Settings = build_http2_settings(Profile),
 
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 ChangeCipher,
@@ -291,6 +675,10 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                 case TicketRecord of
                     <<>> -> [];
                     _ -> [TicketRecord]
+                end |
+                case Http2Settings of
+                    <<>> -> [];
+                    _ -> [as_tls_frame(?TLS_REC_DATA, Http2Settings)]
                 end],
 
     Meta = #{
@@ -299,10 +687,11 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         client_digest => ClientDigest,
         sni_domain    => SniDomain,
         session_ticket => SessionTicket,
-        ocsp_response  => OcspResponse
+        ocsp_response  => OcspResponse,
+        profile_name   => ProfileName,
+        timing_profile => TimingProfile  %% NEW
     },
 
-    Now = erlang:system_time(millisecond),
     St = #st{
         session_ticket = SessionTicket,
         ocsp_response = OcspResponse,
@@ -311,14 +700,9 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                                       false -> undefined
                                   end,
         packet_count = 0,
-        lifecycle = warmup,
-        lifecycle_change_at = 20 + rand:uniform(30),
-        burst_remaining = 0,
-        padding_enabled = true,
-        pad_min = 0,
-        pad_max = 256,
-        last_send_time = Now,
-        connection_start_time = Now
+        profile_name = ProfileName,
+        timing_profile = maps:merge(TimingProfile, TimingBehavior),  %% NEW
+        connection_start = erlang:system_time(millisecond)  %% NEW
     },
 
     {ok, Response, Meta, St}.
@@ -357,6 +741,38 @@ derive_sni_secret(BaseSecret, SniDomain, Salt)
     <<Derived:16/binary, _/binary>> =
         crypto:hash(sha256, [Salt, SecretHex, SniDomain]),
     Derived.
+
+%%%===================================================================
+%%% HTTP/2 Settings Builder (NEW)
+%%%===================================================================
+
+-spec build_http2_settings(map()) -> binary().
+build_http2_settings(#{http2_settings := Settings}) ->
+    #{initial_window_size := InitWindow,
+      max_frame_size := MaxFrame,
+      max_concurrent_streams := MaxStreams,
+      header_table_size := HeaderSize} = Settings,
+    
+    %% Build HTTP/2 SETTINGS frame
+    SettingsPayload = <<
+        16#04:16, InitWindow:32,     %% SETTINGS_INITIAL_WINDOW_SIZE
+        16#05:16, MaxFrame:32,       %% SETTINGS_MAX_FRAME_SIZE
+        16#03:16, MaxStreams:32,     %% SETTINGS_MAX_CONCURRENT_STREAMS
+        16#01:16, HeaderSize:32      %% SETTINGS_HEADER_TABLE_SIZE
+    >>,
+    
+    %% HTTP/2 preface + SETTINGS frame
+    H2Preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
+    FrameHeader = <<
+        (byte_size(SettingsPayload)):24,
+        16#04:8,                      %% SETTINGS frame type
+        16#00:8,                      %% No flags
+        16#00:32                      %% Stream ID 0
+    >>,
+    
+    <<H2Preface/binary, FrameHeader/binary, SettingsPayload/binary>>;
+build_http2_settings(_) ->
+    <<>>.
 
 %%%===================================================================
 %%% ClientHello parser
@@ -448,7 +864,7 @@ make_srv_hello(Digest, SessionId, {Group, Key}, HasSessionTicket, HasOcspStaplin
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %%%===================================================================
-%%% ClientHello generator (minimal)
+%%% ClientHello generator (with deep fingerprint randomization)
 %%%===================================================================
 
 -spec make_client_hello(binary(), binary()) -> binary().
@@ -464,46 +880,250 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain)
 make_client_hello(Timestamp, SessionId, Secret, SniDomain)
   when byte_size(SessionId) =:= 32, byte_size(Secret) =:= 16 ->
 
-    SNI = <<?EXT_SNI:?u16, (byte_size(SniDomain) + 5):?u16,
-            (byte_size(SniDomain) + 3):?u16,
-            ?EXT_SNI_HOST_NAME, (byte_size(SniDomain)):?u16, SniDomain/binary>>,
+    %% Select random browser profile for fingerprint diversity
+    Profile = random_tls_profile(),
 
-    KeyShare = <<?EXT_KEY_SHARE:?u16, 38:?u16, 36:?u16,
-                 16#00, 16#1d, 0, 32, (crypto:strong_rand_bytes(32))/binary>>,
+    %% Build components using profile
+    CipherSuites = build_cipher_suites(Profile),
+    SNI = make_sni([SniDomain]),
+    SigAlgos = build_sig_algos(Profile),
+    SupportedGroups = build_supported_groups(Profile),
 
-    SupportedVersions = <<?EXT_SUPPORTED_VERSIONS:?u16, 3:?u16, 2, ?TLS_13_VERSION>>,
+    SupportedVersionsExt = build_supported_versions_ext(Profile),
+    VersionsLen = byte_size(SupportedVersionsExt),
+    SupportedVersions =
+        <<?EXT_SUPPORTED_VERSIONS:?u16,
+          (VersionsLen + 1):?u16,
+          VersionsLen,
+          SupportedVersionsExt/binary>>,
 
-    SessionTicket = <<?EXT_SESSION_TICKET:?u16, 0:?u16>>,
+    KeyShareEntries = build_key_share_entries(Profile),
+    KSListLen = byte_size(KeyShareEntries),
+    KeyShare =
+        <<?EXT_KEY_SHARE:?u16,
+          (KSListLen + 2):?u16,
+          KSListLen:?u16,
+          KeyShareEntries/binary>>,
 
-    Extensions = [SNI, KeyShare, SupportedVersions, SessionTicket],
+    ECH = build_ech(Profile),
+    ALPN = build_alpn(Profile),
+    CompCertExt = build_compress_certificate(Profile),
+    EcPointExt = build_ec_point_formats(Profile),
+    PaddingExt = build_padding(Profile),
+
+    ExtensionsBase = [
+        ECH,
+        <<16#00, 16#23, 0:16>>,                      % session_ticket
+        EcPointExt,
+        <<16#44, 16#cd, 16#00, 16#05,
+          16#00, 16#03, 16#02, $h, $2>>,             % application_layer_protocol_settings
+        KeyShare,
+        <<16#00, 16#12, 0:16>>,                      % signed_certificate_timestamp
+        SupportedGroups,
+        CompCertExt,
+        <<16#ff, 16#01, 16#00, 16#01, 16#00>>,       % renegotiation_info
+        SigAlgos,
+        <<16#00, 16#05, 16#00, 16#05,
+          16#01, 0:32>>,                             % status_request (OCSP)
+        <<16#00, 16#2d, 16#00, 16#02, 16#01, 16#01>>, % psk_key_exchange_modes
+        ALPN,
+        SNI,
+        SupportedVersions,
+        PaddingExt
+    ],
+
+    %% Filter empty extensions and optionally randomize order
+    NonEmpty = [E || E <- ExtensionsBase, E =/= <<>>],
+    Extensions = case maps:get(extensions_order_randomized, Profile, false) of
+        true -> shuffle_list(NonEmpty);
+        false -> NonEmpty
+    end,
+
     ExtBin = iolist_to_binary(Extensions),
-
-    CipherSuites = <<16#13, 16#01,
-                     16#13, 16#02,
-                     16#13, 16#03>>,
-    CSLen = 6,
-
-    SessIdLen = 32,
+    CSLen = byte_size(CipherSuites),
+    SessIdLen = byte_size(SessionId),
     ExtLen = byte_size(ExtBin),
-
     HelloBodyLen = 2 + 32 + 1 + SessIdLen + 2 + CSLen + 1 + 1 + 2 + ExtLen,
     TlsLen = HelloBodyLen + 4,
 
     Pack = fun(FakeRandom) ->
         <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
           ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
-          FakeRandom:32/binary,
-          SessIdLen, SessionId:32/binary,
+          FakeRandom:?DIGEST_LEN/binary,
+          SessIdLen, SessionId/binary,
           CSLen:?u16, CipherSuites/binary,
           1, 0,
           ExtLen:?u16, ExtBin/binary>>
     end,
 
+    %% REALITY-style: embed timestamp in random field
     Hello0     = Pack(binary:copy(<<0>>, ?DIGEST_LEN)),
     Digest     = hmac(sha256, Secret, Hello0),
     EncTs      = <<0:(?DIGEST_LEN - 4)/unit:8, Timestamp:32/unsigned-little>>,
     FakeRandom = crypto:exor(Digest, EncTs),
     Pack(FakeRandom).
+
+%%%===================================================================
+%%% Extension builders (from v2)
+%%%===================================================================
+
+-spec build_cipher_suites(map()) -> binary().
+build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
+    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
+    GreaseVals = random_grease(GreaseCount),
+
+    WithGrease = lists:foldl(
+        fun(G, Acc) ->
+            Pos = rand:uniform(length(Acc) + 1),
+            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
+        end, Suites, GreaseVals),
+
+    Final = case maps:get(cipher_order_randomized, Profile, false) of
+        true -> shuffle_list(WithGrease);
+        false -> WithGrease
+    end,
+
+    << <<S:?u16>> || S <- Final >>.
+
+-spec build_key_share_entries(map()) -> binary().
+build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
+    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
+    GreaseVals = random_grease(GreaseCount),
+
+    GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
+
+    RealEntries = [
+        begin
+            KeySize = key_size_for_group(Group),
+            Key = crypto:strong_rand_bytes(KeySize),
+            <<Group:?u16, KeySize:?u16, Key/binary>>
+        end
+        || Group <- Groups
+    ],
+
+    AllEntries = lists:foldl(
+        fun(G, Acc) ->
+            Pos = rand:uniform(length(Acc) + 1),
+            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
+        end, RealEntries, GreaseEntries),
+
+    iolist_to_binary(AllEntries).
+
+-spec build_supported_versions_ext(map()) -> binary().
+build_supported_versions_ext(#{supported_versions := Versions,
+                               grease_count := {GreaseMin, GreaseMax}} = Profile) ->
+    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
+    GreaseVals = random_grease(GreaseCount),
+
+    WithGrease = lists:foldl(
+        fun(G, Acc) ->
+            Pos = rand:uniform(length(Acc) + 1),
+            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
+        end, Versions, GreaseVals),
+
+    Final = case maps:get(version_order_randomized, Profile, false) of
+        true -> shuffle_list(WithGrease);
+        false -> WithGrease
+    end,
+
+    << <<V:?u16>> || V <- Final >>.
+
+-spec build_sig_algos(map()) -> binary().
+build_sig_algos(#{sig_algorithms_count := Count}) ->
+    AllAlgos = [
+        16#04, 16#03,  16#05, 16#03,  16#06, 16#03,  16#02, 16#03,
+        16#08, 16#04,  16#08, 16#05,  16#08, 16#06,  16#04, 16#01,
+        16#05, 16#01,  16#06, 16#01,  16#02, 16#01,  16#04, 16#02,
+        16#03, 16#02,  16#02, 16#02,  16#03, 16#01
+    ],
+    Selected = lists:sublist(AllAlgos, Count * 2),
+    Shuffled = shuffle_list(Selected),
+    AlgoListLen = Count * 2,
+    ExtLen = AlgoListLen + 2,
+    <<?EXT_SIGNATURE_ALGORITHMS:?u16,
+      ExtLen:?u16,
+      AlgoListLen:?u16,
+      << <<A:8>> || A <- Shuffled >>/binary>>.
+
+-spec build_ech(map()) -> binary().
+build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
+    PayloadSize = lists:nth(rand:uniform(length(Sizes)), Sizes),
+    EchRand1 = crypto:strong_rand_bytes(1),
+    EchRand32 = crypto:strong_rand_bytes(32),
+    EchPayload = crypto:strong_rand_bytes(PayloadSize),
+    EchContent =
+        <<16#00, 16#00, 16#01, 16#00, 16#01,
+          EchRand1/binary,
+          16#00, 16#20,
+          EchRand32/binary,
+          (byte_size(EchPayload)):?u16,
+          EchPayload/binary>>,
+    <<?EXT_ENCRYPTED_CLIENT_HELLO:?u16,
+      (byte_size(EchContent)):?u16,
+      EchContent/binary>>;
+build_ech(_) ->
+    <<>>.
+
+-spec build_alpn(map()) -> binary().
+build_alpn(#{alpn_protocols := Protocols}) ->
+    Selected = lists:nth(rand:uniform(length(Protocols)), Protocols),
+    ProtocolEntries = << <<(byte_size(P)):8, P/binary>> || P <- Selected >>,
+    ProtocolsLen = byte_size(ProtocolEntries),
+    <<?EXT_ALPN:?u16,
+      (ProtocolsLen + 2):?u16,
+      ProtocolsLen:?u16,
+      ProtocolEntries/binary>>;
+build_alpn(_) ->
+    <<>>.
+
+-spec build_compress_certificate(map()) -> binary().
+build_compress_certificate(#{compress_certificate := brotli}) ->
+    <<16#00, 16#1b, 16#00, 16#03, 16#02, 16#00, 16#02>>;
+build_compress_certificate(_) ->
+    <<>>.
+
+-spec build_ec_point_formats(map()) -> binary().
+build_ec_point_formats(#{ec_point_formats := true}) ->
+    <<?EXT_EC_POINT_FORMATS:?u16, 16#00, 16#02, 16#01, 16#00>>;
+build_ec_point_formats(_) ->
+    <<>>.
+
+-spec build_supported_groups(map()) -> binary().
+build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
+    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
+    GreaseVals = random_grease(GreaseCount),
+
+    WithGrease = lists:foldl(
+        fun(G, Acc) ->
+            Pos = rand:uniform(length(Acc) + 1),
+            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
+        end, Groups, GreaseVals),
+
+    GroupsBin = << <<G:?u16>> || G <- WithGrease >>,
+    GroupsLen = byte_size(GroupsBin),
+    <<?EXT_SUPPORTED_GROUPS:?u16,
+      (GroupsLen + 2):?u16,
+      GroupsLen:?u16,
+      GroupsBin/binary>>.
+
+-spec build_padding(map()) -> binary().
+build_padding(#{padding_size := {Min, Max}}) ->
+    PadSize = Min + rand:uniform(Max - Min + 1),
+    case PadSize of
+        0 -> <<>>;
+        _ ->
+            Padding = binary:copy(<<0>>, PadSize),
+            <<?EXT_PADDING:?u16, PadSize:?u16, Padding/binary>>
+    end;
+build_padding(_) ->
+    <<>>.
+
+-spec make_sni([binary()]) -> binary().
+make_sni(Domains) ->
+    SniListItems = << <<?EXT_SNI_HOST_NAME, (byte_size(Domain)):?u16, Domain/binary>>
+                      || Domain <- Domains >>,
+    ItemsLen = byte_size(SniListItems),
+    <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
 %%%===================================================================
 %%% parse_server_hello
@@ -538,28 +1158,23 @@ tls_records_complete(_B, _N) ->
     false.
 
 %%%===================================================================
-%%% Data stream codec
+%%% Data stream codec (Enhanced with timing mitigation)
 %%%===================================================================
 
 -spec new() -> codec().
 new() ->
-    Now = erlang:system_time(millisecond),
     #st{
         packet_count = 0,
-        lifecycle = steady,
-        lifecycle_change_at = 30 + rand:uniform(50),
-        burst_remaining = 0,
-        padding_enabled = true,
-        pad_min = 0,
-        pad_max = 256,
-        last_send_time = Now,
-        connection_start_time = Now
+        timing_profile = random_timing_profile(),
+        connection_start = erlang:system_time(millisecond)
     }.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
-    NewSt = update_lifecycle(St),
+    NewSt = St#st{packet_count = St#st.packet_count + 1},
+    %% Apply packet spacing for timing mitigation (NEW)
+    apply_packet_spacing(St#st.timing_profile, NewSt#st.packet_count),
     {ok, Data, Tail, NewSt};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
@@ -581,149 +1196,23 @@ decode_all(Bin, Acc, St0) ->
             decode_all(Tail, <<Acc/binary, Data/binary>>, St)
     end.
 
-%%%===================================================================
-%%% Lifecycle Management (Anti-Timing-Analysis Core)
-%%%===================================================================
-
--spec update_lifecycle(#st{}) -> #st{}.
-update_lifecycle(#st{
-    packet_count = Count,
-    lifecycle = Lifecycle,
-    lifecycle_change_at = ChangeAt,
-    burst_remaining = BurstRemaining
-} = St) ->
-    
-    NewCount = Count + 1,
-    
-    {NewLifecycle, NewChangeAt, NewBurstRemaining} =
-        if
-            Lifecycle =:= warmup andalso NewCount >= ChangeAt ->
-                {steady, NewCount + 30 + rand:uniform(70), 0};
-            
-            Lifecycle =:= burst andalso BurstRemaining =< 1 ->
-                {steady, NewCount + 30 + rand:uniform(70), 0};
-            
-            Lifecycle =:= burst ->
-                {burst, ChangeAt, BurstRemaining - 1};
-            
-            Lifecycle =:= idle ->
-                ShouldWake = rand:uniform() < ?PROB_IDLE_TO_STEADY,
-                case ShouldWake of
-                    true -> {warmup, NewCount + 10 + rand:uniform(20), 0};
-                    false -> {idle, ChangeAt, 0}
-                end;
-            
-            Lifecycle =:= steady ->
-                RandomRoll = rand:uniform(),
-                if
-                    RandomRoll < ?PROB_STEADY_TO_BURST ->
-                        BurstLen = 3 + rand:uniform(10),
-                        {burst, ChangeAt, BurstLen};
-                    RandomRoll < (?PROB_STEADY_TO_BURST + ?PROB_STEADY_TO_IDLE) ->
-                        {idle, NewCount + 20 + rand:uniform(40), 0};
-                    true ->
-                        {steady, ChangeAt, 0}
-                end;
-            
-            true ->
-                {Lifecycle, ChangeAt, BurstRemaining}
-        end,
-    
-    St#st{
-        packet_count = NewCount,
-        lifecycle = NewLifecycle,
-        lifecycle_change_at = NewChangeAt,
-        burst_remaining = NewBurstRemaining
-    }.
-
-%%%===================================================================
-%%% STEALTH encode_packet - With Timing & Padding Randomization
-%%%===================================================================
-
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, #st{
-    lifecycle = Lifecycle,
-    padding_enabled = PadEnabled,
-    pad_min = PadMin,
-    pad_max = PadMax,
-    last_send_time = LastSend
-} = St) ->
+encode_packet(Bin, St) ->
+    NewCount = St#st.packet_count + 1,
+    NewSt = St#st{packet_count = NewCount},
     
-    %% ================================================================
-    %% PHASE 1: Add random padding to vary packet size
-    %% ================================================================
-    
-    PaddedBin = case PadEnabled of
+    %% Adaptive timing based on connection state (NEW)
+    case should_burst_packets(St#st.timing_profile) of
         true ->
-            PadSize = PadMin + rand:uniform(PadMax - PadMin + 1),
-            case PadSize of
-                0 -> Bin;
-                _ -> <<Bin/binary, (crypto:strong_rand_bytes(PadSize))/binary>>
-            end;
+            %% Send multiple frames in burst
+            BurstSize = get_burst_size(St#st.timing_profile),
+            BurstPackets = lists:duplicate(BurstSize, as_tls_data_frame(Bin)),
+            {BurstPackets, NewSt};
         false ->
-            Bin
-    end,
-    
-    %% ================================================================
-    %% PHASE 2: Calculate and apply inter-packet delay
-    %% ================================================================
-    
-    {MinGap, MaxGap} = case Lifecycle of
-        warmup -> {?GAP_WARMUP_MIN, ?GAP_WARMUP_MAX};
-        burst  -> {?GAP_BURST_MIN, ?GAP_BURST_MAX};
-        idle   -> {?GAP_IDLE_MIN, ?GAP_IDLE_MAX};
-        steady -> {?GAP_STEADY_MIN, ?GAP_STEADY_MAX}
-    end,
-    
-    %% Add jitter: randomize the gap
-    TargetGap = MinGap + rand:uniform(MaxGap - MinGap + 1),
-    
-    %% Natural jitter: vary by +/- 30%
-    Jitter = round(TargetGap * (0.7 + rand:uniform() * 0.6)),
-    FinalGap = max(1, Jitter),
-    
-    %% Apply delay (non-blocking via timer)
-    Now = erlang:system_time(millisecond),
-    Elapsed = Now - LastSend,
-    
-    if
-        Elapsed < FinalGap ->
-            SleepTime = FinalGap - Elapsed,
-            timer:sleep(SleepTime);
-        true ->
-            ok
-    end,
-    
-    NewNow = erlang:system_time(millisecond),
-    
-    %% ================================================================
-    %% PHASE 3: Update state
-    %% ================================================================
-    
-    NewSt = update_lifecycle(St#st{
-        last_send_time = NewNow
-    }),
-    
-    %% ================================================================
-    %% PHASE 4: Occasional fake application data
-    %% ================================================================
-    
-    FinalData = case Lifecycle of
-        idle ->
-            case rand:uniform(3) of
-                1 ->
-                    %% Send tiny keep-alive like data
-                    KeepAliveSize = rand:uniform(32),
-                    KeepAlive = crypto:strong_rand_bytes(KeepAliveSize),
-                    [as_tls_data_frame(PaddedBin), as_tls_data_frame(KeepAlive)];
-                _ ->
-                    as_tls_data_frame(PaddedBin)
-            end;
-        _ ->
-            as_tls_data_frame(PaddedBin)
-    end,
-    
-    {FinalData, NewSt}.
+            %% Single packet with processing jitter
+            apply_processing_jitter(St#st.timing_profile),
+            {as_tls_data_frame(Bin), NewSt}
+    end.
 
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).
@@ -732,6 +1221,27 @@ as_tls_data_frame(Bin) ->
 as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),
     [<<Type, ?TLS_12_VERSION, Size:?u16>> | Data].
+
+%%%===================================================================
+%%% Adaptive Connection Monitoring (NEW)
+%%%===================================================================
+
+-spec get_connection_stats(codec()) -> map().
+get_connection_stats(#st{connection_start = Start, packet_count = Count} = St) ->
+    case Start of
+        undefined -> #{};
+        _ ->
+            Elapsed = erlang:system_time(millisecond) - Start,
+            #{
+                duration_ms => Elapsed,
+                packet_count => Count,
+                packets_per_second => case Elapsed of
+                    0 -> 0;
+                    _ -> round(Count / (Elapsed / 1000))
+                end,
+                profile_name => St#st.profile_name
+            }
+    end.
 
 %%%===================================================================
 %%% Crypto helpers
@@ -744,3 +1254,14 @@ hmac(Algo, Key, Data) ->
 hmac(Algo, Key, Data) ->
     crypto:hmac(Algo, Key, Data).
 -endif.
+
+%%%===================================================================
+%%% Module Initialization
+%%%===================================================================
+
+%% Initialize caches on module load
+init_caches().
+
+%%%===================================================================
+%%% End of Module
+%%%===================================================================

@@ -1,13 +1,8 @@
 %%%===================================================================
-%%% XTLS-Reality Simulation for MTProto
-%%% 
-%%% چرا Reality بهتره:
-%%% ۱. SNI واقعی داره (نه جعلی)
-%%% ۲. Handshake با سرور واقعی انجام میشه
-%%% ۳. DPI نمیتونه تشخیص بده چون دقیقاً مثل ترافیک واقعیه
+%%% Fake TLS - REALITY Minimal (Clean & Undetectable)
 %%%===================================================================
 
--module(mtp_reality_tls).
+-module(mtp_fake_tls).
 
 -behaviour(mtp_codec).
 
@@ -37,12 +32,9 @@
 %%%===================================================================
 
 -record(st, {
-    %% Session management
     session_ticket :: binary() | undefined,
     ocsp_response :: binary() | undefined,
     session_ticket_lifetime :: non_neg_integer() | undefined,
-    
-    %% Packet counter for lifecycle simulation
     packet_count = 0 :: non_neg_integer()
 }).
 
@@ -159,19 +151,17 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% REALITY Approach: Use real TLS behavior, minimal modification
+%%% REALITY Approach: Clean, minimal TLS
 %%%===================================================================
 
-%% Generate OCSP response (smaller, more realistic)
 generate_ocsp_response() ->
-    <<0, 0, 0, 0>>.  %% Minimal OCSP staple
+    <<0, 0, 0, 0>>.
 
-%% Generate Session Ticket (realistic size)
 generate_session_ticket() ->
     crypto:strong_rand_bytes(64 + rand:uniform(128)).
 
 %%%===================================================================
-%%% from_client_hello - REALITY style
+%%% from_client_hello
 %%%===================================================================
 
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -213,7 +203,6 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     KeyShare = make_key_share(Extensions),
 
-    %% Generate Session Ticket if client supports it
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
             Ticket = generate_session_ticket(),
@@ -223,7 +212,6 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             {undefined, <<>>}
     end,
     
-    %% Generate OCSP response if client supports it
     OcspResponse = case HasOcspStapling of
         true -> generate_ocsp_response();
         false -> undefined
@@ -235,16 +223,11 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
-    %% ================================================================
-    %% REALITY APPROACH: Minimal data after handshake
-    %% Just a single data record, like a normal web server
-    %% ================================================================
-    
-    %% Small realistic response (like a tiny web response)
+    %% Minimal data after handshake
     RealisticData = case rand:uniform(3) of
         1 -> <<"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n">>;
-        2 -> rand:bytes(rand:uniform(256));  %% Small binary response
-        3 -> <<>>  %% Empty (keep-alive probe)
+        2 -> crypto:strong_rand_bytes(rand:uniform(256));
+        3 -> <<>>
     end,
 
     Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), 
@@ -324,7 +307,7 @@ derive_sni_secret(BaseSecret, SniDomain, Salt)
     Derived.
 
 %%%===================================================================
-%%% ClientHello parser (unchanged)
+%%% ClientHello parser
 %%%===================================================================
 
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
@@ -429,7 +412,7 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain)
 make_client_hello(Timestamp, SessionId, Secret, SniDomain)
   when byte_size(SessionId) =:= 32, byte_size(Secret) =:= 16 ->
     
-    %% Minimal extensions - just what's needed
+    %% Minimal extensions
     SNI = <<?EXT_SNI:?u16, (byte_size(SniDomain) + 5):?u16,
             (byte_size(SniDomain) + 3):?u16,
             ?EXT_SNI_HOST_NAME, (byte_size(SniDomain)):?u16, SniDomain/binary>>,
@@ -445,9 +428,9 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain)
     ExtBin = iolist_to_binary(Extensions),
     
     %% Minimal cipher suites (just TLS 1.3)
-    CipherSuites = <<16#13, 16#01,   %% TLS_AES_128_GCM_SHA256
-                     16#13, 16#02,   %% TLS_AES_256_GCM_SHA384
-                     16#13, 16#03>>, %% TLS_CHACHA20_POLY1305_SHA256
+    CipherSuites = <<16#13, 16#01,
+                     16#13, 16#02,
+                     16#13, 16#03>>,
     CSLen = 6,
     
     SessIdLen = 32,
@@ -505,14 +488,12 @@ tls_records_complete(_B, _N) ->
     false.
 
 %%%===================================================================
-%%% Data stream codec - Minimal, like real TLS
+%%% Data stream codec
 %%%===================================================================
 
 -spec new() -> codec().
 new() ->
-    #st{
-        packet_count = 0
-    }.
+    #st{packet_count = 0}.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.

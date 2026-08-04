@@ -1,5 +1,5 @@
 %%%===================================================================
-%%% Fake TLS - REALITY Minimal (Clean & Undetectable)
+%%% Fake TLS - STEALTH TIMING (Reality + Anti-Timing-Analysis)
 %%%===================================================================
 
 -module(mtp_fake_tls).
@@ -35,7 +35,25 @@
     session_ticket :: binary() | undefined,
     ocsp_response :: binary() | undefined,
     session_ticket_lifetime :: non_neg_integer() | undefined,
-    packet_count = 0 :: non_neg_integer()
+    
+    %% Packet counting for lifecycle simulation
+    packet_count = 0 :: non_neg_integer(),
+    
+    %% Timing simulation state
+    lifecycle = steady :: warmup | steady | burst | idle,
+    lifecycle_change_at = 0 :: non_neg_integer(),
+    burst_remaining = 0 :: non_neg_integer(),
+    
+    %% Padding randomization
+    padding_enabled = true :: boolean(),
+    pad_min = 0 :: non_neg_integer(),
+    pad_max = 256 :: non_neg_integer(),
+    
+    %% Last send time for gap calculation
+    last_send_time = 0 :: non_neg_integer(),
+    
+    %% Connection start for lifecycle management
+    connection_start_time = 0 :: non_neg_integer()
 }).
 
 -record(client_hello, {
@@ -91,6 +109,32 @@
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
 -define(EXT_KEY_SHARE,          51).
+
+%%%===================================================================
+%%% Timing Constants (milliseconds)
+%%%===================================================================
+
+%% Normal web browsing inter-packet gaps
+-define(GAP_STEADY_MIN, 50).
+-define(GAP_STEADY_MAX, 500).
+
+%% Warm-up phase (initial page load) - faster packets
+-define(GAP_WARMUP_MIN, 10).
+-define(GAP_WARMUP_MAX, 100).
+
+%% Burst phase (loading new page/resource) - very fast
+-define(GAP_BURST_MIN, 5).
+-define(GAP_BURST_MAX, 50).
+
+%% Idle phase (user reading) - long pauses
+-define(GAP_IDLE_MIN, 5000).
+-define(GAP_IDLE_MAX, 30000).
+
+%% Lifecycle transition probabilities (per packet)
+-define(PROB_STEADY_TO_BURST, 0.05).    %% 5% chance to burst
+-define(PROB_STEADY_TO_IDLE, 0.02).     %% 2% chance to idle
+-define(PROB_BURST_TO_STEADY, 0.3).     %% 30% chance to end burst
+-define(PROB_IDLE_TO_STEADY, 0.1).      %% 10% chance to wake up
 
 %%%===================================================================
 %%% Types
@@ -151,7 +195,7 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% REALITY Approach: Clean, minimal TLS
+%%% OCSP and Session Ticket helpers
 %%%===================================================================
 
 generate_ocsp_response() ->
@@ -172,7 +216,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         session_id   = SessionId,
         extensions   = Extensions
     } = parse_client_hello(Data),
-    
+
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
         {_, [{?EXT_SNI_HOST_NAME, Domain}]} -> Domain;
         _ ->
@@ -211,7 +255,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         false ->
             {undefined, <<>>}
     end,
-    
+
     OcspResponse = case HasOcspStapling of
         true -> generate_ocsp_response();
         false -> undefined
@@ -223,16 +267,15 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
-    %% Minimal data after handshake
     RealisticData = case rand:uniform(3) of
         1 -> <<"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n">>;
         2 -> crypto:strong_rand_bytes(rand:uniform(256));
         3 -> <<>>
     end,
 
-    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), 
+    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
                  ChangeCipher,
-                 as_tls_frame(?TLS_REC_DATA, RealisticData) | 
+                 as_tls_frame(?TLS_REC_DATA, RealisticData) |
                  case TicketRecord of
                      <<>> -> [];
                      _ -> [TicketRecord]
@@ -242,7 +285,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
                               HasSessionTicket, HasOcspStapling),
 
-    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), 
+    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 ChangeCipher,
                 as_tls_frame(?TLS_REC_DATA, RealisticData) |
                 case TicketRecord of
@@ -259,6 +302,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         ocsp_response  => OcspResponse
     },
 
+    Now = erlang:system_time(millisecond),
     St = #st{
         session_ticket = SessionTicket,
         ocsp_response = OcspResponse,
@@ -266,9 +310,17 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                                       true -> 604800;
                                       false -> undefined
                                   end,
-        packet_count = 0
+        packet_count = 0,
+        lifecycle = warmup,
+        lifecycle_change_at = 20 + rand:uniform(30),
+        burst_remaining = 0,
+        padding_enabled = true,
+        pad_min = 0,
+        pad_max = 256,
+        last_send_time = Now,
+        connection_start_time = Now
     },
-    
+
     {ok, Response, Meta, St}.
 
 -spec from_client_hello(binary(), binary()) ->
@@ -362,27 +414,27 @@ make_key_share(Exts) ->
 
 make_srv_hello(Digest, SessionId, {Group, Key}, HasSessionTicket, HasOcspStapling) ->
     KeyShareEntity = <<Group:?u16, (byte_size(Key)):?u16, Key/binary>>,
-    
+
     ExtensionsBase = [
         <<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity) + 2):?u16,
           (byte_size(KeyShareEntity)):?u16, KeyShareEntity/binary>>,
         <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>
     ],
-    
+
     ExtensionsWithTicket = case HasSessionTicket of
         true ->
             ExtensionsBase ++ [<<?EXT_SESSION_TICKET:?u16, 0:?u16>>];
         false ->
             ExtensionsBase
     end,
-    
+
     ExtensionsFinal = case HasOcspStapling of
         true ->
             ExtensionsWithTicket ++ [<<?EXT_STATUS_REQUEST:?u16, 0:?u16>>];
         false ->
             ExtensionsWithTicket
     end,
-    
+
     SessionSize = byte_size(SessionId),
     Payload = [
         <<?TLS_12_VERSION,
@@ -411,34 +463,32 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain)
     make_client_hello(Timestamp, SessionId, mtp_handler:unhex(HexSecret), SniDomain);
 make_client_hello(Timestamp, SessionId, Secret, SniDomain)
   when byte_size(SessionId) =:= 32, byte_size(Secret) =:= 16 ->
-    
-    %% Minimal extensions
+
     SNI = <<?EXT_SNI:?u16, (byte_size(SniDomain) + 5):?u16,
             (byte_size(SniDomain) + 3):?u16,
             ?EXT_SNI_HOST_NAME, (byte_size(SniDomain)):?u16, SniDomain/binary>>,
-    
+
     KeyShare = <<?EXT_KEY_SHARE:?u16, 38:?u16, 36:?u16,
                  16#00, 16#1d, 0, 32, (crypto:strong_rand_bytes(32))/binary>>,
-    
+
     SupportedVersions = <<?EXT_SUPPORTED_VERSIONS:?u16, 3:?u16, 2, ?TLS_13_VERSION>>,
-    
+
     SessionTicket = <<?EXT_SESSION_TICKET:?u16, 0:?u16>>,
-    
+
     Extensions = [SNI, KeyShare, SupportedVersions, SessionTicket],
     ExtBin = iolist_to_binary(Extensions),
-    
-    %% Minimal cipher suites (just TLS 1.3)
+
     CipherSuites = <<16#13, 16#01,
                      16#13, 16#02,
                      16#13, 16#03>>,
     CSLen = 6,
-    
+
     SessIdLen = 32,
     ExtLen = byte_size(ExtBin),
-    
+
     HelloBodyLen = 2 + 32 + 1 + SessIdLen + 2 + CSLen + 1 + 1 + 2 + ExtLen,
     TlsLen = HelloBodyLen + 4,
-    
+
     Pack = fun(FakeRandom) ->
         <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
           ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
@@ -448,7 +498,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain)
           1, 0,
           ExtLen:?u16, ExtBin/binary>>
     end,
-    
+
     Hello0     = Pack(binary:copy(<<0>>, ?DIGEST_LEN)),
     Digest     = hmac(sha256, Secret, Hello0),
     EncTs      = <<0:(?DIGEST_LEN - 4)/unit:8, Timestamp:32/unsigned-little>>,
@@ -493,12 +543,24 @@ tls_records_complete(_B, _N) ->
 
 -spec new() -> codec().
 new() ->
-    #st{packet_count = 0}.
+    Now = erlang:system_time(millisecond),
+    #st{
+        packet_count = 0,
+        lifecycle = steady,
+        lifecycle_change_at = 30 + rand:uniform(50),
+        burst_remaining = 0,
+        padding_enabled = true,
+        pad_min = 0,
+        pad_max = 256,
+        last_send_time = Now,
+        connection_start_time = Now
+    }.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
-    {ok, Data, Tail, St};
+    NewSt = update_lifecycle(St),
+    {ok, Data, Tail, NewSt};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
@@ -519,11 +581,149 @@ decode_all(Bin, Acc, St0) ->
             decode_all(Tail, <<Acc/binary, Data/binary>>, St)
     end.
 
+%%%===================================================================
+%%% Lifecycle Management (Anti-Timing-Analysis Core)
+%%%===================================================================
+
+-spec update_lifecycle(#st{}) -> #st{}.
+update_lifecycle(#st{
+    packet_count = Count,
+    lifecycle = Lifecycle,
+    lifecycle_change_at = ChangeAt,
+    burst_remaining = BurstRemaining
+} = St) ->
+    
+    NewCount = Count + 1,
+    
+    {NewLifecycle, NewChangeAt, NewBurstRemaining} =
+        if
+            Lifecycle =:= warmup andalso NewCount >= ChangeAt ->
+                {steady, NewCount + 30 + rand:uniform(70), 0};
+            
+            Lifecycle =:= burst andalso BurstRemaining =< 1 ->
+                {steady, NewCount + 30 + rand:uniform(70), 0};
+            
+            Lifecycle =:= burst ->
+                {burst, ChangeAt, BurstRemaining - 1};
+            
+            Lifecycle =:= idle ->
+                ShouldWake = rand:uniform() < ?PROB_IDLE_TO_STEADY,
+                case ShouldWake of
+                    true -> {warmup, NewCount + 10 + rand:uniform(20), 0};
+                    false -> {idle, ChangeAt, 0}
+                end;
+            
+            Lifecycle =:= steady ->
+                RandomRoll = rand:uniform(),
+                if
+                    RandomRoll < ?PROB_STEADY_TO_BURST ->
+                        BurstLen = 3 + rand:uniform(10),
+                        {burst, ChangeAt, BurstLen};
+                    RandomRoll < (?PROB_STEADY_TO_BURST + ?PROB_STEADY_TO_IDLE) ->
+                        {idle, NewCount + 20 + rand:uniform(40), 0};
+                    true ->
+                        {steady, ChangeAt, 0}
+                end;
+            
+            true ->
+                {Lifecycle, ChangeAt, BurstRemaining}
+        end,
+    
+    St#st{
+        packet_count = NewCount,
+        lifecycle = NewLifecycle,
+        lifecycle_change_at = NewChangeAt,
+        burst_remaining = NewBurstRemaining
+    }.
+
+%%%===================================================================
+%%% STEALTH encode_packet - With Timing & Padding Randomization
+%%%===================================================================
+
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, St) ->
-    NewCount = St#st.packet_count + 1,
-    NewSt = St#st{packet_count = NewCount},
-    {as_tls_data_frame(Bin), NewSt}.
+encode_packet(Bin, #st{
+    lifecycle = Lifecycle,
+    padding_enabled = PadEnabled,
+    pad_min = PadMin,
+    pad_max = PadMax,
+    last_send_time = LastSend
+} = St) ->
+    
+    %% ================================================================
+    %% PHASE 1: Add random padding to vary packet size
+    %% ================================================================
+    
+    PaddedBin = case PadEnabled of
+        true ->
+            PadSize = PadMin + rand:uniform(PadMax - PadMin + 1),
+            case PadSize of
+                0 -> Bin;
+                _ -> <<Bin/binary, (crypto:strong_rand_bytes(PadSize))/binary>>
+            end;
+        false ->
+            Bin
+    end,
+    
+    %% ================================================================
+    %% PHASE 2: Calculate and apply inter-packet delay
+    %% ================================================================
+    
+    {MinGap, MaxGap} = case Lifecycle of
+        warmup -> {?GAP_WARMUP_MIN, ?GAP_WARMUP_MAX};
+        burst  -> {?GAP_BURST_MIN, ?GAP_BURST_MAX};
+        idle   -> {?GAP_IDLE_MIN, ?GAP_IDLE_MAX};
+        steady -> {?GAP_STEADY_MIN, ?GAP_STEADY_MAX}
+    end,
+    
+    %% Add jitter: randomize the gap
+    TargetGap = MinGap + rand:uniform(MaxGap - MinGap + 1),
+    
+    %% Natural jitter: vary by +/- 30%
+    Jitter = round(TargetGap * (0.7 + rand:uniform() * 0.6)),
+    FinalGap = max(1, Jitter),
+    
+    %% Apply delay (non-blocking via timer)
+    Now = erlang:system_time(millisecond),
+    Elapsed = Now - LastSend,
+    
+    if
+        Elapsed < FinalGap ->
+            SleepTime = FinalGap - Elapsed,
+            timer:sleep(SleepTime);
+        true ->
+            ok
+    end,
+    
+    NewNow = erlang:system_time(millisecond),
+    
+    %% ================================================================
+    %% PHASE 3: Update state
+    %% ================================================================
+    
+    NewSt = update_lifecycle(St#st{
+        last_send_time = NewNow
+    }),
+    
+    %% ================================================================
+    %% PHASE 4: Occasional fake application data
+    %% ================================================================
+    
+    FinalData = case Lifecycle of
+        idle ->
+            case rand:uniform(3) of
+                1 ->
+                    %% Send tiny keep-alive like data
+                    KeepAliveSize = rand:uniform(32),
+                    KeepAlive = crypto:strong_rand_bytes(KeepAliveSize),
+                    [as_tls_data_frame(PaddedBin), as_tls_data_frame(KeepAlive)];
+                _ ->
+                    as_tls_data_frame(PaddedBin)
+            end;
+        _ ->
+            as_tls_data_frame(PaddedBin)
+    end,
+    
+    {FinalData, NewSt}.
 
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).

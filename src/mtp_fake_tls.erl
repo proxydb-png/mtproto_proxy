@@ -13,7 +13,7 @@
 %%% - Adaptive behavior based on network conditions
 %%%===================================================================
 
--module(mtp_fake_tls_hypernuclear).
+-module(mtp_fake_tls).
 
 -behaviour(mtp_codec).
 
@@ -490,7 +490,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         pseudorandom = ClientDigest,
         session_id   = SessionId,
         extensions   = Extensions
-    } = CliHlo = parse_client_hello(Data),
+    } = parse_client_hello(Data),
     
     ?LOG_DEBUG("TLS ClientHello extensions: ~p", [Extensions]),
 
@@ -1331,14 +1331,18 @@ encode_packet(Bin, #chaos_state{
                 {Profile, ProfRotCount + 1, ProfRotAt}
         end,
     
-    %% Burst mode management
+    %% Burst mode management - FIXED: moved rand:uniform() outside guard
+    BurstRoll = rand:uniform(),
+    BurstLimitReached = BurstMode andalso (BurstCount >= 5),
+    ShouldEnterBurst = (not BurstMode) andalso (BurstRoll < 0.1),
+    
     {NewBurstMode, NewBurstCount} = 
         if
-            BurstMode andalso BurstCount >= 5 ->
+            BurstLimitReached ->
                 {false, 0};
             BurstMode ->
                 {true, BurstCount + 1};
-            rand:uniform() < 0.1 ->
+            ShouldEnterBurst ->
                 {true, 0};
             true ->
                 {false, BurstCount}
@@ -1376,8 +1380,10 @@ encode_packet(Bin, #chaos_state{
     %% PHASE 4: Fake Record Injection
     %% ================================================================
     
+    %% FIXED: moved rand:uniform() outside guard
+    FakeRoll = rand:uniform(),
     {FinalFragments, FinalCount} = 
-        case rand:uniform() < FakeProb of
+        case FakeRoll < FakeProb of
             true ->
                 FakeSize = FakeMin + rand:uniform(FakeMax - FakeMin),
                 FakeData = case rand:uniform(4) of
@@ -1410,8 +1416,9 @@ encode_packet(Bin, #chaos_state{
         _ -> MimicryMode
     end,
     
-    %% Randomly inject mimicry frame
-    NewMimicrySeq = case rand:uniform() < 0.15 of
+    %% FIXED: moved rand:uniform() outside guard
+    MimicryRoll = rand:uniform(),
+    NewMimicrySeq = case MimicryRoll < 0.15 of
         true ->
             MimicryFrame = build_fake_mimicry_frame(NewMimicryMode),
             [MimicryFrame | MimicrySeq];
@@ -1468,8 +1475,9 @@ fragment_data_chaos(Bin, FragSize, EntropyBytes, Profile)
     [as_tls_data_frame(EnhancedData)];
 fragment_data_chaos(Bin, FragSize, EntropyBytes, Profile) ->
     <<Chunk:FragSize/binary, Rest/binary>> = Bin,
-    %% Sometimes add extra small fragment for chaos
-    ExtraFrag = case rand:uniform() < 0.1 of
+    %% FIXED: moved rand:uniform() outside guard
+    ExtraRoll = rand:uniform(),
+    ExtraFrag = case ExtraRoll < 0.1 of
         true ->
             ExtraSize = rand:uniform(50) + 10,
             ExtraData = crypto:strong_rand_bytes(ExtraSize),

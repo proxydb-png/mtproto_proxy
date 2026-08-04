@@ -395,10 +395,11 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     end,
     FakeHttpData = generate_realistic_http_data(FakeHttpSize),
     
+    %% Handshake frames MUST use TLS 1.2 for compatibility
     Response0 = [_, CC, DD] =
-        [as_tls_frame_handshake(SrvHello0),
+        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame_data_with_evasion(FakeHttpData)],
+         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SrvSessionId, KeyShare),
     
@@ -408,7 +409,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         _ -> []
     end,
     
-    Response = DummyRecords ++ [as_tls_frame_handshake(SrvHello),
+    Response = DummyRecords ++ [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
                 DD],
     Meta0 = #{session_id => SessionId,
@@ -489,16 +490,10 @@ generate_realistic_http_data(Size) ->
 %% Generate dummy TLS records with realistic-looking content
 -spec generate_dummy_record() -> iodata().
 generate_dummy_record() ->
-    Types = [?TLS_REC_HANDSHAKE, ?TLS_REC_DATA, ?TLS_REC_DATA],
+    Types = [?TLS_REC_DATA],
     Type = lists:nth(rand:uniform(length(Types)), Types),
     Size = rand:uniform(200),
-    Payload = case Type of
-        ?TLS_REC_HANDSHAKE ->
-            <<(rand:uniform(255)), (rand:uniform(255)), (rand:uniform(255)), Size:?u24,
-              (crypto:strong_rand_bytes(Size - 4))/binary>>;
-        _ ->
-            generate_realistic_http_data(Size)
-    end,
+    Payload = generate_realistic_http_data(Size),
     as_tls_frame_with_random_version(Type, Payload).
 
 %% ============================================================================
@@ -1101,17 +1096,12 @@ encode_as_frames_with_variable_size(Bin, MaxSize, St) ->
 %% @doc Create TLS data frame with DPI evasion (random version + padding)
 -spec as_tls_frame_data_with_evasion(binary()) -> iodata().
 as_tls_frame_data_with_evasion(Bin) ->
-    %% Randomize record version
+    %% Randomize record version for data frames
     Version = random_record_version(),
     Size = byte_size(Bin),
     [<<?TLS_REC_DATA, Version/binary, Size:?u16>> | Bin].
 
-%% @doc Create TLS frame for handshake (fixed version for consistency)
--spec as_tls_frame_handshake(iodata()) -> iodata().
-as_tls_frame_handshake(Data) ->
-    as_tls_frame(?TLS_REC_HANDSHAKE, Data).
-
-%% @doc Create standard TLS frame
+%% @doc Create standard TLS frame (fixed TLS 1.2 for handshake)
 -spec as_tls_frame(byte(), iodata()) -> iodata().
 as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),

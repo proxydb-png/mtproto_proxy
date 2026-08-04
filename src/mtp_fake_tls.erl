@@ -4,7 +4,7 @@
 %%% Fake TLS 'CBC' stream codec
 %%% https://github.com/telegramdesktop/tdesktop/commit/69b6b487382c12efc43d52f472cab5954ab850e2
 %%% It's not real TLS, but it looks like TLS1.3 from outside
-%%% Enhanced with deep fingerprint randomization for maximum evasion
+%%% Enhanced with deep fingerprint randomization and DPI evasion
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -35,7 +35,8 @@
 
 %% `profile' caches the selected fingerprint profile so that a connection can
 %% keep a consistent fingerprint across multiple interactions if needed.
--record(st, {profile :: map() | undefined}).
+-record(st, {profile :: map() | undefined,
+             packet_count = 0 :: non_neg_integer()}).
 
 -record(client_hello,
         {pseudorandom :: binary(),
@@ -50,6 +51,7 @@
 
 -define(MAX_IN_PACKET_SIZE, 65535).
 -define(MAX_OUT_PACKET_SIZE, 16384).
+-define(MIN_OUT_PACKET_SIZE, 2048).
 
 -define(TLS_10_VERSION, 3, 1).
 -define(TLS_12_VERSION, 3, 3).
@@ -347,6 +349,7 @@ match_domain(Domain, Allowed) ->
 %% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
 %% Version WITH domain checking.
+%% Handshake is STABLE - no DPI evasion here.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -890,12 +893,12 @@ tls_records_complete(_B, _N) ->
     false.
 
 %% ============================================================================
-%% Data stream codec
+%% Data stream codec with DPI evasion
 %% ============================================================================
 
 -spec new() -> codec().
 new() ->
-    #st{}.
+    #st{packet_count = 0}.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.
@@ -921,18 +924,65 @@ decode_all(Bin, Acc, St0) ->
             decode_all(Tail, <<Acc/binary, Data/binary>>, St)
     end.
 
+%% ============================================================================
+%% @doc Encode packet with DPI evasion
+%% ============================================================================
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, St) ->
-    {encode_as_frames(Bin), St}.
+encode_packet(Bin, St0) ->
+    #st{packet_count = Count} = St0,
+    {Frames, St1} = encode_with_evasion(Bin, St0),
+    NewCount = Count + 1,
+    {Frames, St1#st{packet_count = NewCount}}.
 
-encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
-    as_tls_data_frame(Bin);
-encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
-    [as_tls_data_frame(Chunk) | encode_as_frames(Tail)].
+-spec encode_with_evasion(binary(), #st{}) -> {iodata(), #st{}}.
+encode_with_evasion(Bin, St) ->
+    %% Random fragment size between MIN and MAX
+    FragSize = rand_range({?MIN_OUT_PACKET_SIZE, ?MAX_OUT_PACKET_SIZE}),
+    
+    %% Encode with variable size and padding
+    {MainFrames, St1} = encode_variable(Bin, FragSize, St),
+    
+    %% Maybe add dummy records (15% chance)
+    case rand:uniform() < 0.15 of
+        true ->
+            NumDummy = rand_range({1, 2}),
+            Dummies = [make_dummy_record() || _ <- lists:seq(1, NumDummy)],
+            {Dummies ++ MainFrames, St1};
+        false ->
+            {MainFrames, St1}
+    end.
 
-as_tls_data_frame(Bin) ->
-    as_tls_frame(?TLS_REC_DATA, Bin).
+%% @doc Encode binary into TLS frames with variable size and padding
+-spec encode_variable(binary(), non_neg_integer(), #st{}) -> {[iodata()], #st{}}.
+encode_variable(Bin, MaxSize, St) when byte_size(Bin) =< MaxSize ->
+    %% Add random padding (0-255 bytes)
+    PadLen = rand_range({0, 255}),
+    Padding = crypto:strong_rand_bytes(PadLen),
+    {[make_data_frame(<<Bin/binary, Padding/binary>>)], St};
+encode_variable(Bin, MaxSize, St) ->
+    %% Split into chunks
+    <<Chunk:MaxSize/binary, Tail/binary>> = Bin,
+    {Frames, St1} = encode_variable(Tail, MaxSize, St),
+    
+    %% Variable padding per chunk
+    PadLen = rand_range({0, 127}),
+    Padding = crypto:strong_rand_bytes(PadLen),
+    {[make_data_frame(<<Chunk/binary, Padding/binary>>) | Frames], St1}.
 
+%% @doc Create a TLS data frame (always TLS 1.2 for compatibility)
+-spec make_data_frame(binary()) -> iodata().
+make_data_frame(Bin) ->
+    Size = byte_size(Bin),
+    [<<?TLS_REC_DATA, ?TLS_12_VERSION, Size:?u16>> | Bin].
+
+%% @doc Create a dummy TLS record with random data
+-spec make_dummy_record() -> iodata().
+make_dummy_record() ->
+    Size = rand_range({1, 200}),
+    Payload = crypto:strong_rand_bytes(Size),
+    make_data_frame(Payload).
+
+%% @doc Standard TLS frame for handshake (always TLS 1.2)
 -spec as_tls_frame(byte(), iodata()) -> iodata().
 as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),

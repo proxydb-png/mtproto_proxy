@@ -4,7 +4,7 @@
 %%% Fake TLS 'CBC' stream codec
 %%% https://github.com/telegramdesktop/tdesktop/commit/69b6b487382c12efc43d52f472cab5954ab850e2
 %%% It's not real TLS, but it looks like TLS1.3 from outside
-%%% Enhanced with deep fingerprint randomization and DPI evasion
+%%% Enhanced with deep fingerprint randomization for maximum evasion
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -33,11 +33,9 @@
 
 -dialyzer(no_improper_lists).
 
--record(st, {
-    jitter_buffer = [] :: list(),
-    last_record_time = 0 :: non_neg_integer(),
-    record_count = 0 :: non_neg_integer()
-}).
+%% `profile' caches the selected fingerprint profile so that a connection can
+%% keep a consistent fingerprint across multiple interactions if needed.
+-record(st, {profile :: map() | undefined}).
 
 -record(client_hello,
         {pseudorandom :: binary(),
@@ -52,7 +50,6 @@
 
 -define(MAX_IN_PACKET_SIZE, 65535).
 -define(MAX_OUT_PACKET_SIZE, 16384).
--define(MIN_OUT_PACKET_SIZE, 4096).
 
 -define(TLS_10_VERSION, 3, 1).
 -define(TLS_12_VERSION, 3, 3).
@@ -81,6 +78,28 @@
 -define(EXT_SUPPORTED_VERSIONS, 43).
 
 -define(APP, mtproto_proxy).
+
+%% ============================================================================
+%% Key-share groups we accept from the client's ClientHello.
+%% Includes the hybrid post-quantum group X25519MLKEM768.
+%% ============================================================================
+-define(SUPPORTED_KEY_SHARE_GROUPS,
+        [16#0017,  % secp256r1
+         16#0018,  % secp384r1
+         16#0019,  % secp521r1
+         16#001D,  % x25519
+         16#001E,  % x448
+         16#0100,  % ffdhe2048
+         16#0101,  % ffdhe3072
+         16#0102,  % ffdhe4096
+         16#0103,  % ffdhe6144
+         16#0104,  % ffdhe8192
+         16#11EC   % X25519MLKEM768 (hybrid PQ, 1216-byte key)
+        ]).
+
+%% Upper bound for an acceptable key-share key size. X25519MLKEM768 is the
+%% largest at 1216 bytes; anything above that is treated as malformed.
+-define(MAX_KEY_SHARE_SIZE, 1216).
 
 %% ============================================================================
 %% GREASE values for random insertion (RFC 8701)
@@ -133,16 +152,14 @@
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [176, 208, 240],
-      session_id_length => {31, 32},
+      session_id_length => {32, 32},
       extensions_order_randomized => true,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>],
           [<<"h2">>],
           [<<"http/1.1">>]
       ],
-      padding_size => {0, 512},
-      record_version_randomization => true,
-      dummy_record_probability => 0.2
+      padding_size => {0, 512}
     },
     #{name => firefox_121,
       cipher_suites => [
@@ -175,18 +192,16 @@
           16#03, 16#03
       ],
       version_order_randomized => false,
-      sig_algorithms_count => 17,
+      sig_algorithms_count => 15,
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [144, 176],
-      session_id_length => {28, 32},
+      session_id_length => {32, 32},
       extensions_order_randomized => false,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 256},
-      record_version_randomization => false,
-      dummy_record_probability => 0.15
+      padding_size => {0, 256}
     },
     #{name => safari_17,
       cipher_suites => [
@@ -218,14 +233,12 @@
       ec_point_formats => false,
       compress_certificate => none,
       ech_payload_size => [208, 240],
-      session_id_length => {0, 32},
+      session_id_length => {32, 32},
       extensions_order_randomized => false,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 512},
-      record_version_randomization => true,
-      dummy_record_probability => 0.25
+      padding_size => {0, 512}
     },
     #{name => edge_120,
       cipher_suites => [
@@ -257,19 +270,17 @@
           16#03, 16#03
       ],
       version_order_randomized => true,
-      sig_algorithms_count => 16,
+      sig_algorithms_count => 15,
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [176, 208],
-      session_id_length => {24, 32},
+      session_id_length => {32, 32},
       extensions_order_randomized => true,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>],
           [<<"h2">>]
       ],
-      padding_size => {0, 512},
-      record_version_randomization => true,
-      dummy_record_probability => 0.2
+      padding_size => {0, 512}
     }
 ]).
 
@@ -278,8 +289,7 @@
 -type meta() :: #{session_id := binary(),
                   timestamp := non_neg_integer(),
                   client_digest := binary(),
-                  sni_domain => binary(),
-                  profile => atom()}.
+                  sni_domain => binary()}.
 
 
 %% ============================================================================
@@ -336,7 +346,7 @@ match_domain(Domain, Allowed) ->
 
 %% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Version WITH domain checking and DPI evasion.
+%% Version WITH domain checking.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -377,39 +387,17 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
         error({protocol_error, tls_invalid_digest, XoredDigest}),
     KeyShare = make_key_share(Extensions),
-    
-    %% Randomize session ID length for DPI evasion
-    SessIdLen = rand:uniform(32),
-    SrvSessionId = case SessIdLen of
-        0 -> <<>>;
-        _ -> crypto:strong_rand_bytes(SessIdLen)
-    end,
-    
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SrvSessionId, KeyShare),
-    
-    %% Random fake HTTP data with variable size and entropy
-    FakeHttpSize = case rand:uniform(3) of
-        1 -> rand:uniform(128);                    % small
-        2 -> 128 + rand:uniform(384);              % medium
-        3 -> 512 + rand:uniform(1024)              % large
-    end,
-    FakeHttpData = generate_realistic_http_data(FakeHttpSize),
-    
-    %% Handshake frames MUST use TLS 1.2 for compatibility
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
+    %% Guarantee at least one byte of fake application data so that servers
+    %% which reject zero-length records are not tripped up.
+    FakeHttpData = crypto:strong_rand_bytes(rand:uniform(255) + 1),
     Response0 = [_, CC, DD] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
          as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SrvSessionId, KeyShare),
-    
-    %% Add dummy records randomly for DPI confusion
-    DummyRecords = case rand:uniform(4) of
-        1 -> [generate_dummy_record() || _ <- lists:seq(1, rand:uniform(2))];
-        _ -> []
-    end,
-    
-    Response = DummyRecords ++ [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
+    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
                 DD],
     Meta0 = #{session_id => SessionId,
@@ -457,66 +445,6 @@ derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 
         crypto:hash(sha256, [Salt, SecretHex, SniDomain]),
     Derived.
 
-%% ============================================================================
-%% DPI Evasion Helper Functions
-%% ============================================================================
-
-%% Generate realistic-looking HTTP data with lower entropy
--spec generate_realistic_http_data(non_neg_integer()) -> binary().
-generate_realistic_http_data(Size) ->
-    Templates = [
-        <<"GET / HTTP/1.1\r\nHost: ">>,
-        <<"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n">>,
-        <<"POST /api/v1/data HTTP/1.1\r\nContent-Length: ">>,
-        <<"HTTP/1.1 302 Found\r\nLocation: https://">>
-    ],
-    Template = lists:nth(rand:uniform(length(Templates)), Templates),
-    TemplateSize = byte_size(Template),
-    if
-        Size =< TemplateSize ->
-            binary:part(Template, {0, Size});
-        true ->
-            PadSize = Size - TemplateSize,
-            %% Mix of printable ASCII and random bytes
-            Padding = << << (case rand:uniform(3) of
-                                1 -> $a + rand:uniform(26) - 1;
-                                2 -> $A + rand:uniform(26) - 1;
-                                3 -> rand:uniform(255)
-                            end) >>
-                         || _ <- lists:seq(1, PadSize) >>,
-            <<Template/binary, Padding/binary>>
-    end.
-
-%% Generate dummy TLS records with realistic-looking content
--spec generate_dummy_record() -> iodata().
-generate_dummy_record() ->
-    Types = [?TLS_REC_DATA],
-    Type = lists:nth(rand:uniform(length(Types)), Types),
-    Size = rand:uniform(200),
-    Payload = generate_realistic_http_data(Size),
-    as_tls_frame_with_random_version(Type, Payload).
-
-%% ============================================================================
-%% Random TLS record version for DPI evasion
-%% ============================================================================
--spec random_record_version() -> binary().
-random_record_version() ->
-    case rand:uniform(4) of
-        1 -> <<?TLS_10_VERSION>>;
-        2 -> <<?TLS_12_VERSION>>;
-        3 -> <<?TLS_13_VERSION>>;
-        4 -> <<?TLS_12_VERSION>>  % Bias toward TLS 1.2
-    end.
-
--spec as_tls_frame_with_random_version(byte(), iodata()) -> iodata().
-as_tls_frame_with_random_version(Type, Data) ->
-    Version = random_record_version(),
-    Size = iolist_size(Data),
-    [<<Type, Version/binary, Size:?u16>> | Data].
-
-%% ============================================================================
-%% Parse functions
-%% ============================================================================
 
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloLen:?u24, ?TLS_12_VERSION,
@@ -525,7 +453,11 @@ parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      CipherSuitesLen:?u16, CipherSuites:CipherSuitesLen/binary,
                      CompMethodsLen, CompMethods:CompMethodsLen/binary,
                      ExtensionsLen:?u16, Extensions:ExtensionsLen/binary>>
-                  ) when TlsFrameLen >= 512, HelloLen >= 400 ->
+                  ) when TlsFrameLen >= 512,
+                         HelloLen >= 400,
+                         %% The TLS record must be large enough to contain the
+                         %% whole handshake message (4-byte handshake header).
+                         TlsFrameLen >= HelloLen + 4 ->
     #client_hello{
        pseudorandom = Random,
        session_id = SessId,
@@ -567,21 +499,9 @@ make_key_share(Exts) ->
                 lists:dropwhile(
                   fun({Group, Key}) ->
                           not (
-                            byte_size(Key) < 128
+                            byte_size(Key) =< ?MAX_KEY_SHARE_SIZE
                             andalso
-                            lists:member(
-                              Group, [
-                                      16#0017,  % secp256r1
-                                      16#0018,  % secp384r1
-                                      16#0019,  % secp521r1
-                                      16#001D,  % x25519
-                                      16#001E,  % x448
-                                      16#0100,  % ffdhe2048
-                                      16#0101,  % ffdhe3072
-                                      16#0102,  % ffdhe4096
-                                      16#0103,  % ffdhe6144
-                                      16#0104   % ffdhe8192
-                              ])
+                            lists:member(Group, ?SUPPORTED_KEY_SHARE_GROUPS)
                            )
                   end, KeyShares),
             case SupportedKeyShares of
@@ -623,6 +543,28 @@ random_tls_profile() ->
     Profile.
 
 %% ============================================================================
+%% @doc Uniform integer in the inclusive range [Min, Max].
+%%      Fixes the off-by-one that used to shift results above the range.
+%% @end
+%% ============================================================================
+-spec rand_range({non_neg_integer(), non_neg_integer()}) -> non_neg_integer().
+rand_range({Min, Max}) when Max >= Min ->
+    Min + rand:uniform(Max - Min + 1) - 1.
+
+%% ============================================================================
+%% @doc Insert each item at a random position of the accumulator list.
+%%      Used to sprinkle GREASE values across a list.
+%% @end
+%% ============================================================================
+-spec insert_at_random_positions(list(), list()) -> list().
+insert_at_random_positions(Items, Into) ->
+    lists:foldl(
+      fun(Item, Acc) ->
+              Pos = rand:uniform(length(Acc) + 1),
+              lists:sublist(Acc, Pos - 1) ++ [Item] ++ lists:nthtail(Pos - 1, Acc)
+      end, Into, Items).
+
+%% ============================================================================
 %% @doc Generate random GREASE values
 %% @end
 %% ============================================================================
@@ -631,7 +573,7 @@ random_grease(Count) ->
     [lists:nth(rand:uniform(length(?GREASE_VALUES)), ?GREASE_VALUES) || _ <- lists:seq(1, Count)].
 
 %% ============================================================================
-%% @doc Fisher-Yates shuffle for lists
+%% @doc Fisher-Yates style shuffle for lists (uses process-local rand state).
 %% @end
 %% ============================================================================
 -spec shuffle_list(list()) -> list().
@@ -645,21 +587,13 @@ shuffle_list(List) ->
 %% @end
 %% ============================================================================
 -spec build_cipher_suites(map()) -> binary().
-build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Suites, GreaseVals),
-    
+build_cipher_suites(#{cipher_suites := Suites, grease_count := GreaseSpec} = Profile) ->
+    GreaseVals = random_grease(rand_range(GreaseSpec)),
+    WithGrease = insert_at_random_positions(GreaseVals, Suites),
     Final = case maps:get(cipher_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
     end,
-    
     << <<S:?u16>> || S <- Final >>.
 
 %% ============================================================================
@@ -667,12 +601,9 @@ build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, Greas
 %% @end
 %% ============================================================================
 -spec build_key_share_entries(map()) -> binary().
-build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
+build_key_share_entries(#{key_share_groups := Groups, grease_count := GreaseSpec}) ->
+    GreaseVals = random_grease(rand_range(GreaseSpec)),
     GreaseEntries = [<<G:?u16, 16#00, 16#01, 16#00>> || G <- GreaseVals],
-    
     RealEntries = [
         begin
             KeySize = key_size_for_group(Group),
@@ -681,13 +612,7 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
         end
         || Group <- Groups
     ],
-    
-    AllEntries = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, RealEntries, GreaseEntries),
-    
+    AllEntries = insert_at_random_positions(GreaseEntries, RealEntries),
     iolist_to_binary(AllEntries).
 
 %% ============================================================================
@@ -703,59 +628,43 @@ key_size_for_group(16#11EC) -> 1216;  % X25519MLKEM768
 key_size_for_group(_) -> 32.
 
 %% ============================================================================
-%% @doc Build supported versions extension with GREASE
+%% @doc Build supported versions extension body with GREASE
 %% @end
 %% ============================================================================
 -spec build_supported_versions_ext(map()) -> binary().
-build_supported_versions_ext(#{supported_versions := Versions, 
-                               grease_count := {GreaseMin, GreaseMax}} = Profile) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Versions, GreaseVals),
-    
+build_supported_versions_ext(#{supported_versions := Versions,
+                               grease_count := GreaseSpec} = Profile) ->
+    GreaseVals = random_grease(rand_range(GreaseSpec)),
+    WithGrease = insert_at_random_positions(GreaseVals, Versions),
     Final = case maps:get(version_order_randomized, Profile, false) of
         true -> shuffle_list(WithGrease);
         false -> WithGrease
     end,
-    
     << <<V:?u16>> || V <- Final >>.
 
 %% ============================================================================
-%% @doc Build signature algorithms from profile
+%% @doc Build signature algorithms from profile.
+%%      Algorithms are kept as {hash, signature} byte pairs so shuffling and
+%%      slicing operate on whole algorithms rather than individual bytes.
 %% @end
 %% ============================================================================
 -spec build_sig_algos(map()) -> binary().
 build_sig_algos(#{sig_algorithms_count := Count}) ->
     AllAlgos = [
-        16#04, 16#03,
-        16#05, 16#03,
-        16#06, 16#03,
-        16#02, 16#03,
-        16#08, 16#04,
-        16#08, 16#05,
-        16#08, 16#06,
-        16#04, 16#01,
-        16#05, 16#01,
-        16#06, 16#01,
-        16#02, 16#01,
-        16#04, 16#02,
-        16#03, 16#02,
-        16#02, 16#02,
-        16#03, 16#01
+        {16#04, 16#03}, {16#05, 16#03}, {16#06, 16#03}, {16#02, 16#03},
+        {16#08, 16#04}, {16#08, 16#05}, {16#08, 16#06}, {16#04, 16#01},
+        {16#05, 16#01}, {16#06, 16#01}, {16#02, 16#01}, {16#04, 16#02},
+        {16#03, 16#02}, {16#02, 16#02}, {16#03, 16#01}
     ],
-    Selected = lists:sublist(AllAlgos, Count * 2),
-    Shuffled = shuffle_list(Selected),
-    AlgoListLen = Count * 2,
+    %% Count may exceed the number of available algorithms; sublist clamps it.
+    Selected = lists:sublist(shuffle_list(AllAlgos), Count),
+    AlgoBin = << <<A:8, B:8>> || {A, B} <- Selected >>,
+    AlgoListLen = byte_size(AlgoBin),
     ExtLen = AlgoListLen + 2,
     <<16#00, 16#0d,
       ExtLen:?u16,
       AlgoListLen:?u16,
-      << <<A:8>> || A <- Shuffled >>/binary>>.
+      AlgoBin/binary>>.
 
 %% ============================================================================
 %% @doc Build ECH extension from profile
@@ -821,16 +730,9 @@ build_ec_point_formats(_) ->
 %% @end
 %% ============================================================================
 -spec build_supported_groups(map()) -> binary().
-build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
-    GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1),
-    GreaseVals = random_grease(GreaseCount),
-    
-    WithGrease = lists:foldl(
-        fun(G, Acc) ->
-            Pos = rand:uniform(length(Acc) + 1),
-            lists:sublist(Acc, Pos - 1) ++ [G] ++ lists:nthtail(Pos - 1, Acc)
-        end, Groups, GreaseVals),
-    
+build_supported_groups(#{key_share_groups := Groups, grease_count := GreaseSpec}) ->
+    GreaseVals = random_grease(rand_range(GreaseSpec)),
+    WithGrease = insert_at_random_positions(GreaseVals, Groups),
     GroupsBin = << <<G:?u16>> || G <- WithGrease >>,
     GroupsLen = byte_size(GroupsBin),
     <<16#00, 16#0a,
@@ -843,11 +745,11 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
 %% @end
 %% ============================================================================
 -spec build_padding(map()) -> binary().
-build_padding(#{padding_size := {Min, Max}}) ->
-    PadSize = Min + rand:uniform(Max - Min + 1),
-    case PadSize of
-        0 -> <<>>;
-        _ ->
+build_padding(#{padding_size := {_Min, _Max} = Range}) ->
+    case rand_range(Range) of
+        0 ->
+            <<>>;
+        PadSize ->
             Padding = binary:copy(<<0>>, PadSize),
             <<16#00, 16#15, PadSize:?u16, Padding/binary>>
     end;
@@ -870,29 +772,21 @@ make_sni(Domains) ->
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
     make_client_hello(erlang:system_time(second),
-                      generate_variable_session_id(),
+                      crypto:strong_rand_bytes(32),
                       Secret, SniDomain).
-
--spec generate_variable_session_id() -> binary().
-generate_variable_session_id() ->
-    %% Random length between 0 and 32 bytes
-    case rand:uniform(4) of
-        1 -> <<>>;  % Empty session ID
-        2 -> crypto:strong_rand_bytes(rand:uniform(16));
-        _ -> crypto:strong_rand_bytes(16 + rand:uniform(16))
-    end.
 
 -spec make_client_hello(non_neg_integer(), binary(), binary(), binary()) -> binary().
 make_client_hello(Timestamp, SessionId, HexSecret, SniDomain) when byte_size(HexSecret) == 32 ->
     make_client_hello(Timestamp, SessionId, mtp_handler:unhex(HexSecret), SniDomain);
-make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Secret) == 16 ->
+make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(SessionId) == 32,
+                                                                byte_size(Secret) == 16 ->
     Profile = random_tls_profile(),
 
     CipherSuites = build_cipher_suites(Profile),
     SNI = make_sni([SniDomain]),
     SigAlgos = build_sig_algos(Profile),
     SupportedGroups = build_supported_groups(Profile),
-    
+
     SupportedVersionsExt = build_supported_versions_ext(Profile),
     VersionsLen = byte_size(SupportedVersionsExt),
     SupportedVersions =
@@ -948,12 +842,8 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Secret
     ExtLen = byte_size(ExtBin),
     HelloBodyLen = 2 + 32 + 1 + SessIdLen + 2 + CSLen + 1 + 1 + 2 + ExtLen,
     TlsLen = HelloBodyLen + 4,
-    
-    %% Use random record version for DPI evasion
-    RecVersion = random_record_version(),
-    
     Pack = fun(FakeRandom) ->
-                   <<?TLS_REC_HANDSHAKE, RecVersion/binary, TlsLen:?u16,
+                   <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
                      FakeRandom:?DIGEST_LEN/binary,
                      SessIdLen, SessionId/binary,
@@ -1000,15 +890,12 @@ tls_records_complete(_B, _N) ->
     false.
 
 %% ============================================================================
-%% Data stream codec with DPI evasion
+%% Data stream codec
 %% ============================================================================
 
 -spec new() -> codec().
 new() ->
-    #st{
-        last_record_time = erlang:monotonic_time(millisecond),
-        record_count = 0
-    }.
+    #st{}.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.
@@ -1034,74 +921,18 @@ decode_all(Bin, Acc, St0) ->
             decode_all(Tail, <<Acc/binary, Data/binary>>, St)
     end.
 
-%% ============================================================================
-%% @doc Encode packet with DPI evasion techniques
-%% - Variable fragment sizes
-%% - Random padding
-%% - Dummy records
-%% - Timing jitter (managed externally)
-%% @end
-%% ============================================================================
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, St0) ->
-    {Frames, St1} = encode_with_dpi_evasion(Bin, St0),
-    {Frames, St1}.
+encode_packet(Bin, St) ->
+    {encode_as_frames(Bin), St}.
 
--spec encode_with_dpi_evasion(binary(), #st{}) -> {iodata(), #st{}}.
-encode_with_dpi_evasion(Bin, #st{record_count = Count} = St) ->
-    %% Variable fragment sizes for DPI evasion
-    MinSize = ?MIN_OUT_PACKET_SIZE,
-    MaxSize = ?MAX_OUT_PACKET_SIZE,
-    
-    %% Randomize fragment size within range
-    FragSize = MinSize + rand:uniform(MaxSize - MinSize),
-    
-    {MainFrames, St1} = encode_as_frames_with_variable_size(Bin, FragSize, St),
-    
-    %% Occasionally add dummy records
-    DummyProb = rand:uniform(),
-    {DummyFrames, St2} = if
-        DummyProb < 0.15 ->  % 15% chance
-            NumDummy = rand:uniform(2),
-            Dummies = [generate_dummy_record() || _ <- lists:seq(1, NumDummy)],
-            {Dummies, St1};
-        true ->
-            {[], St1}
-    end,
-    
-    AllFrames = DummyFrames ++ MainFrames,
-    NewCount = Count + 1,
-    {AllFrames, St2#st{record_count = NewCount}}.
+encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
+    as_tls_data_frame(Bin);
+encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
+    [as_tls_data_frame(Chunk) | encode_as_frames(Tail)].
 
-%% @doc Encode binary into TLS frames with variable size and padding
--spec encode_as_frames_with_variable_size(binary(), non_neg_integer(), #st{}) -> {[iodata()], #st{}}.
-encode_as_frames_with_variable_size(Bin, MaxSize, St) when byte_size(Bin) =< MaxSize ->
-    %% Add random padding to data frames
-    PadLen = case rand:uniform(5) of
-        1 -> rand:uniform(256);     % Large padding
-        _ -> rand:uniform(32)       % Small padding
-    end,
-    Padding = crypto:strong_rand_bytes(PadLen),
-    {[as_tls_frame_data_with_evasion(<<Bin/binary, Padding/binary>>)], St};
-encode_as_frames_with_variable_size(Bin, MaxSize, St) ->
-    %% Split binary into chunks
-    <<Chunk:MaxSize/binary, Tail/binary>> = Bin,
-    {Frames, St1} = encode_as_frames_with_variable_size(Tail, MaxSize, St),
-    
-    %% Vary padding for each chunk
-    PadLen = rand:uniform(64),
-    Padding = crypto:strong_rand_bytes(PadLen),
-    {[as_tls_frame_data_with_evasion(<<Chunk/binary, Padding/binary>>) | Frames], St1}.
+as_tls_data_frame(Bin) ->
+    as_tls_frame(?TLS_REC_DATA, Bin).
 
-%% @doc Create TLS data frame with DPI evasion (random version + padding)
--spec as_tls_frame_data_with_evasion(binary()) -> iodata().
-as_tls_frame_data_with_evasion(Bin) ->
-    %% Randomize record version for data frames
-    Version = random_record_version(),
-    Size = byte_size(Bin),
-    [<<?TLS_REC_DATA, Version/binary, Size:?u16>> | Bin].
-
-%% @doc Create standard TLS frame (fixed TLS 1.2 for handshake)
 -spec as_tls_frame(byte(), iodata()) -> iodata().
 as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),

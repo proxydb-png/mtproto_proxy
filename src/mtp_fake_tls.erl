@@ -1,16 +1,11 @@
 %%%===================================================================
-%%% Fake TLS - HYPER-NUCLEAR VERSION v3.0
-%%% Combining:
-%%% - Chaos Fragmentation Engine with entropy equalization
-%%% - Multi-profile rotation mid-connection
-%%% - Deep packet camouflage with layered fake records
-%%% - Timing randomization & jitter injection
-%%% - Protocol mimicry switching (HTTP/2, gRPC, WebSocket patterns)
-%%% - Entropy normalization to defeat statistical analysis
-%%% - Dynamic padding with traffic morphing
-%%% - Fake renegotiation & session resumption patterns
-%%% - Cross-profile cipher suite blending
-%%% - Adaptive behavior based on network conditions
+%%% Fake TLS - STEALTH NUCLEAR v4.0
+%%% Approach: Realistic traffic simulation, not random noise
+%%% - Mimics real browser TLS 1.3 + HTTP/2 behavior
+%%% - Natural timing patterns with jitter
+%%% - Realistic ServerHello with actual HTTP/2 frames
+%%% - Randomized but protocol-compliant record sequences
+%%% - Connection lifecycle simulation (warm-up, steady, teardown)
 %%%===================================================================
 
 -module(mtp_fake_tls).
@@ -39,48 +34,34 @@
 -dialyzer(no_improper_lists).
 
 %%%===================================================================
-%%% Records - Enhanced State Machine
+%%% Connection Lifecycle State
 %%%===================================================================
 
--record(chaos_state, {
-    %% Fragmentation chaos
-    frag_min = 200        :: pos_integer(),
-    frag_max = 3000       :: pos_integer(),
-    packet_count = 0      :: non_neg_integer(),
-    frag_reset_at = 0     :: non_neg_integer(),
-    
-    %% Fake record injection
-    fake_probability = 0.3 :: float(),
-    fake_min_size = 8     :: pos_integer(),
-    fake_max_size = 256   :: pos_integer(),
-    
-    %% Timing chaos
-    send_jitter_us = 0    :: non_neg_integer(),
-    burst_mode = false    :: boolean(),
-    burst_count = 0       :: non_neg_integer(),
-    
-    %% Profile management
-    current_profile :: map(),
-    profile_rotation_count = 0 :: non_neg_integer(),
-    profile_rotation_at :: non_neg_integer(),
-    
-    %% Entropy management
-    entropy_pool = <<>>   :: binary(),
-    entropy_threshold = 64 :: pos_integer(),
-    
-    %% Protocol mimicry
-    mimicry_mode = http2  :: http2 | grpc | websocket | random,
-    mimicry_sequence = [] :: [binary()],
-    
-    %% Session management
+-define(LIFECYCLE_WARMUP, 1).    %% Just connected - send handshake overhead
+-define(LIFECYCLE_STEADY, 2).    %% Normal operation
+-define(LIFECYCLE_BURST, 3).     %% Occasional burst (like page load)
+
+-record(st, {
+    %% Core TLS state
     session_ticket :: binary() | undefined,
     ocsp_response :: binary() | undefined,
     session_ticket_lifetime :: non_neg_integer() | undefined,
     
-    %% Adaptive learning
-    connection_start_time :: non_neg_integer(),
-    bytes_sent = 0        :: non_neg_integer(),
-    adaptation_level = 1  :: 1..5
+    %% Lifecycle management
+    lifecycle = ?LIFECYCLE_WARMUP :: 1..3,
+    packets_sent = 0 :: non_neg_integer(),
+    lifecycle_change_at :: non_neg_integer(),
+    
+    %% HTTP/2 simulation
+    stream_id = 1 :: pos_integer(),
+    h2_settings_sent = false :: boolean(),
+    
+    %% Profile (for ClientHello generation)
+    current_profile :: map(),
+    
+    %% Packet scheduling
+    last_send_time :: non_neg_integer(),
+    inter_packet_gap_us :: non_neg_integer()
 }).
 
 -record(client_hello, {
@@ -92,7 +73,7 @@
 }).
 
 %%%===================================================================
-%%% Constants & Macros
+%%% Constants
 %%%===================================================================
 
 -define(u16, 16/unsigned-big).
@@ -138,7 +119,7 @@
 -define(EXT_KEY_SHARE,          51).
 
 %%%===================================================================
-%%% GREASE Values (RFC 8701) - Extended
+%%% GREASE Values
 %%%===================================================================
 
 -define(GREASE_VALUES, [
@@ -149,11 +130,11 @@
 ]).
 
 %%%===================================================================
-%%% HYPER-NUCLEAR: Enhanced TLS Fingerprint Profiles with Cross-breeding
+%%% Realistic TLS Profiles (focused on Chrome-like behavior)
 %%%===================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
-    #{name => chrome_120_hyper,
+    #{name => chrome_120_stealth,
       cipher_suites => [
           16#1301, 16#1302, 16#1303,
           16#c02b, 16#c02f, 16#c02c, 16#c030,
@@ -163,171 +144,35 @@
           16#002f, 16#0035
       ],
       cipher_order_randomized => true,
-      grease_count => {3, 6},
-      key_share_groups => [
-          16#11ec, 16#001d, 16#0017, 16#0018, 16#0019
-      ],
-      supported_versions => [
-          16#0304, 16#0303, 16#0302
-      ],
-      version_order_randomized => true,
-      sig_algorithms_count => 18,
-      ec_point_formats => true,
-      ech_payload_size => [160, 176, 208, 240, 288],
-      session_id_length => {32, 32},
-      extensions_order_randomized => true,
-      alpn_protocols => [
-          [<<"h2">>, <<"http/1.1">>],
-          [<<"h2">>, <<"grpc">>, <<"http/1.1">>],
-          [<<"h2">>],
-          [<<"http/1.1">>]
-      ],
-      padding_size => {64, 1024},
-      session_ticket_enabled => true,
-      ocsp_stapling_enabled => true,
-      fake_renegotiation => true,
-      entropy_profile => high
-    },
-    #{name => firefox_121_hyper,
-      cipher_suites => [
-          16#1301, 16#1302, 16#1303,
-          16#c02b, 16#c02f, 16#c02c, 16#c030,
-          16#cca9, 16#cca8,
-          16#c013, 16#c014,
-          16#009c, 16#009d,
-          16#002f, 16#0035,
-          16#003c, 16#003d,
-          16#002c, 16#003c
-      ],
-      cipher_order_randomized => true,
-      grease_count => {3, 5},
-      key_share_groups => [
-          16#001d, 16#0017, 16#001e
-      ],
-      supported_versions => [
-          16#0304, 16#0303
-      ],
-      version_order_randomized => false,
-      sig_algorithms_count => 20,
-      ec_point_formats => true,
-      ech_payload_size => [144, 176, 208],
-      session_id_length => {32, 32},
-      extensions_order_randomized => false,
-      alpn_protocols => [
-          [<<"h2">>, <<"http/1.1">>],
-          [<<"http/1.1">>]
-      ],
-      padding_size => {64, 512},
-      session_ticket_enabled => true,
-      ocsp_stapling_enabled => false,
-      fake_renegotiation => true,
-      entropy_profile => medium
-    },
-    #{name => safari_17_hyper,
-      cipher_suites => [
-          16#1301, 16#1302, 16#1303,
-          16#c02b, 16#c02f, 16#c02c, 16#c030,
-          16#cca9, 16#cca8,
-          16#c013, 16#c014,
-          16#009c, 16#009d
-      ],
-      cipher_order_randomized => false,
-      grease_count => {2, 5},
-      key_share_groups => [
-          16#001d, 16#0017, 16#0018, 16#0019, 16#001a
-      ],
-      supported_versions => [
-          16#0304, 16#0303
-      ],
-      version_order_randomized => false,
-      sig_algorithms_count => 16,
-      ec_point_formats => false,
-      ech_payload_size => [208, 240, 288],
-      session_id_length => {32, 32},
-      extensions_order_randomized => false,
-      alpn_protocols => [
-          [<<"h2">>, <<"http/1.1">>],
-          [<<"h2">>]
-      ],
-      padding_size => {64, 1024},
-      session_ticket_enabled => false,
-      ocsp_stapling_enabled => true,
-      fake_renegotiation => false,
-      entropy_profile => high
-    },
-    #{name => edge_120_hyper,
-      cipher_suites => [
-          16#1301, 16#1302, 16#1303,
-          16#c02b, 16#c02f, 16#c02c, 16#c030,
-          16#cca9, 16#cca8,
-          16#c013, 16#c014,
-          16#009c, 16#009d,
-          16#002f, 16#0035,
-          16#009e, 16#009f
-      ],
-      cipher_order_randomized => true,
-      grease_count => {3, 6},
+      grease_count => {2, 4},
       key_share_groups => [
           16#11ec, 16#001d, 16#0017, 16#0018
       ],
       supported_versions => [
-          16#0304, 16#0303, 16#0302
+          16#0304, 16#0303
       ],
       version_order_randomized => true,
-      sig_algorithms_count => 18,
+      sig_algorithms_count => 15,
       ec_point_formats => true,
       ech_payload_size => [176, 208, 240],
       session_id_length => {32, 32},
       extensions_order_randomized => true,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>],
-          [<<"h2">>, <<"grpc">>, <<"http/1.1">>],
-          [<<"h2">>]
+          [<<"h2">>],
+          [<<"http/1.1">>]
       ],
-      padding_size => {64, 1024},
+      padding_size => {32, 512},
       session_ticket_enabled => true,
-      ocsp_stapling_enabled => true,
-      fake_renegotiation => true,
-      entropy_profile => high
+      ocsp_stapling_enabled => true
     }
 ]).
-
-%%%===================================================================
-%%% Protocol Mimicry Patterns
-%%%===================================================================
-
--define(MIMICRY_PATTERNS, #{
-    http2 => [
-        %% HTTP/2 SETTINGS frame pattern
-        <<16#00, 16#00, 16#00, 16#04, 16#00, 16#00, 16#00, 16#00, 16#00>>,
-        %% HTTP/2 WINDOW_UPDATE
-        <<16#00, 16#00, 16#04, 16#08, 16#00, 16#00, 16#00, 16#00, 16#00,
-          16#00, 16#0f, 16#00, 16#00>>,
-        %% HTTP/2 HEADERS frame
-        <<16#00, 16#00, 16#08, 16#01, 16#04, 16#00, 16#00, 16#00, 16#00,
-          16#00, 16#00, 16#00, 16#00>>
-    ],
-    grpc => [
-        %% gRPC DATA frame
-        <<16#00, 16#00, 16#00, 16#00, 16#00>>,
-        %% gRPC HEADERS
-        <<16#00, 16#00, 16#00, 16#00, 16#01>>
-    ],
-    websocket => [
-        %% WebSocket ping frame
-        <<16#89, 16#80, 16#00, 16#00, 16#00, 16#00>>,
-        %% WebSocket text frame
-        <<16#81, 16#80, 16#00, 16#00, 16#00, 16#00>>,
-        %% WebSocket close frame
-        <<16#88, 16#80, 16#00, 16#00, 16#00, 16#00>>
-    ]
-}).
 
 %%%===================================================================
 %%% Types
 %%%===================================================================
 
--opaque codec() :: #chaos_state{}.
+-opaque codec() :: #st{}.
 
 -type meta() :: #{
     session_id     := binary(),
@@ -339,7 +184,7 @@
 }.
 
 %%%===================================================================
-%%% Secret helpers (unchanged from original)
+%%% Secret helpers
 %%%===================================================================
 
 -spec format_secret_hex(binary(), binary()) -> binary().
@@ -382,61 +227,62 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% HYPER-NUCLEAR: Entropy Equalization Engine
+%%% HTTP/2 Frame Builders (Realistic Protocol Simulation)
 %%%===================================================================
 
--spec normalize_entropy(binary(), map()) -> binary().
-normalize_entropy(Data, #{entropy_profile := high}) ->
-    %% High entropy - inject random bytes to flatten distribution
-    ByteCount = byte_size(Data),
-    InjectionCount = ByteCount div 8,
-    Injection = crypto:strong_rand_bytes(InjectionCount),
-    <<Data/binary, Injection/binary>>;
-normalize_entropy(Data, #{entropy_profile := medium}) ->
-    %% Medium entropy - moderate injection
-    ByteCount = byte_size(Data),
-    InjectionCount = ByteCount div 16,
-    Injection = crypto:strong_rand_bytes(InjectionCount),
-    <<Data/binary, Injection/binary>>;
-normalize_entropy(Data, _) ->
-    Data.
+%% Simulates HTTP/2 SETTINGS frame - browsers send this immediately after handshake
+build_h2_settings() ->
+    %% SETTINGS frame: type=4, flags=0, stream_id=0
+    Settings = [
+        %% SETTINGS_HEADER_TABLE_SIZE (0x1) = 65536
+        <<16#00, 16#01, 16#00, 16#01, 16#00, 16#00>>,
+        %% SETTINGS_MAX_CONCURRENT_STREAMS (0x3) = 1000
+        <<16#00, 16#03, 16#00, 16#00, 16#03, 16#e8>>,
+        %% SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 6291456
+        <<16#00, 16#04, 16#00, 16#60, 16#00, 16#00>>,
+        %% SETTINGS_MAX_FRAME_SIZE (0x5) = 16384
+        <<16#00, 16#05, 16#00, 16#00, 16#40, 16#00>>
+    ],
+    Payload = iolist_to_binary(Settings),
+    Len = byte_size(Payload),
+    <<Len:?u24, 16#04, 16#00, 16#00, 16#00, 16#00, 16#00, Payload/binary>>.
 
-%%%===================================================================
-%%% HYPER-NUCLEAR: Fake Data Generators
-%%%===================================================================
+%% Simulates HTTP/2 WINDOW_UPDATE frame
+build_h2_window_update(StreamId, Increment) ->
+    <<16#04:?u24, 16#08, 16#00, StreamId:32, Increment:32>>.
 
-build_fake_certificate_data() ->
-    CertSize = 600 + rand:uniform(1000),
-    crypto:strong_rand_bytes(CertSize).
+%% Simulates HTTP/2 HEADERS frame (GET request pattern)
+build_h2_headers(StreamId) ->
+    %% HPACK encoded minimal headers (pre-built for common patterns)
+    HeadersPatterns = [
+        %% :method GET, :path /, :scheme https, :authority based
+        <<16#82, 16#86, 16#84, 16#41, 16#8c, 16#f1, 16#e3, 16#c2,
+          16#e5, 16#f2, 16#3a, 16#6b, 16#a0, 16#ab, 16#90, 16#f4,
+          16#ff>>,
+        %% Slightly different ordering
+        <<16#82, 16#84, 16#86, 16#41, 16#8c, 16#f1, 16#e3, 16#c2,
+          16#e5, 16#f2, 16#3a, 16#6b, 16#a0, 16#ab, 16#90, 16#f4,
+          16#ff, 16#00>>
+    ],
+    Headers = lists:nth(rand:uniform(length(HeadersPatterns)), HeadersPatterns),
+    PadLen = rand:uniform(16) - 1,
+    TotalLen = byte_size(Headers) + PadLen + 1,
+    Padding = rand:bytes(PadLen),
+    <<TotalLen:?u24, 16#01, 16#04, StreamId:32,
+      PadLen:8, Headers/binary, Padding/binary>>.
 
-build_fake_session_ticket_data() ->
-    TicketSize = 100 + rand:uniform(300),
-    crypto:strong_rand_bytes(TicketSize).
+%% HTTP/2 PING frame (browsers send this periodically)
+build_h2_ping() ->
+    PingData = crypto:strong_rand_bytes(8),
+    <<16#08:?u24, 16#06, 16#00, 16#00, 16#00, 16#00, 16#00, 16#00,
+      PingData/binary>>.
 
-build_fake_padding_record(Min, Max) ->
-    PadSize = Min + rand:uniform(Max - Min + 1),
-    crypto:strong_rand_bytes(PadSize).
-
-build_fake_http_data(_Profile) ->
-    FakeDataSize = 50 + rand:uniform(1000),
-    crypto:strong_rand_bytes(FakeDataSize).
-
-build_fake_renegotiation() ->
-    %% Fake TLS renegotiation pattern
-    RenegSize = 32 + rand:uniform(96),
-    crypto:strong_rand_bytes(RenegSize).
-
-build_fake_mimicry_frame(MimicryMode) ->
-    Patterns = maps:get(MimicryMode, ?MIMICRY_PATTERNS, []),
-    case Patterns of
-        [] -> <<>>;
-        _ ->
-            Base = lists:nth(rand:uniform(length(Patterns)), Patterns),
-            %% Extend with random data
-            ExtraSize = rand:uniform(32),
-            Extra = crypto:strong_rand_bytes(ExtraSize),
-            <<Base/binary, Extra/binary>>
-    end.
+%% HTTP/2 GOAWAY frame (for graceful connection end simulation)
+build_h2_goaway(LastStreamId) ->
+    AdditionalData = rand:bytes(rand:uniform(16)),
+    TotalLen = 8 + byte_size(AdditionalData),
+    <<TotalLen:?u24, 16#07, 16#00, 16#00, 16#00, 16#00, 16#00, 16#00,
+      LastStreamId:32, 0:32, AdditionalData/binary>>.
 
 %%%===================================================================
 %%% OCSP and Session Ticket generators
@@ -480,7 +326,7 @@ generate_session_ticket(_Secret) ->
       0:?u16>>.
 
 %%%===================================================================
-%%% HYPER-NUCLEAR: from_client_hello with Chaos Engine
+%%% from_client_hello - Stealth version
 %%%===================================================================
 
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -527,28 +373,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     KeyShare = make_key_share(Extensions),
 
-    %% Select initial profile
-    Profile = random_tls_profile(),
-    
-    %% Generate all fake data with entropy normalization
-    FakeHttpData = normalize_entropy(build_fake_http_data(Profile), Profile),
-    FakeCert = normalize_entropy(build_fake_certificate_data(), Profile),
-    FakeTicket = normalize_entropy(build_fake_session_ticket_data(), Profile),
-    FakeRenegotiation = case maps:get(fake_renegotiation, Profile, false) of
-        true -> build_fake_renegotiation();
-        false -> <<>>
-    end,
-    
-    %% Multiple padding records of varying sizes
-    Padding1 = build_fake_padding_record(16, 128),
-    Padding2 = build_fake_padding_record(32, 256),
-    Padding3 = build_fake_padding_record(8, 64),
-    
-    %% Generate mimicry frames
-    MimicryFrame1 = build_fake_mimicry_frame(http2),
-    MimicryFrame2 = build_fake_mimicry_frame(grpc),
-    MimicryFrame3 = build_fake_mimicry_frame(websocket),
-
+    %% Generate Session Ticket
     {SessionTicket, TicketRecord} = case HasSessionTicket of
         true ->
             Ticket = generate_session_ticket(Secret),
@@ -569,156 +394,31 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
-    %% HYPER-NUCLEAR: 16 different ordering patterns with multi-layer camouflage
-    DataFrames = case rand:uniform(16) of
-        1 -> [as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, Padding2),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame2)];
-        2 -> [as_tls_frame(?TLS_REC_DATA, FakeCert),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-              as_tls_frame(?TLS_REC_DATA, Padding3)];
-        3 -> [as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, Padding2),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1)];
-        4 -> [as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, Padding2)];
-        5 -> [as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              as_tls_frame(?TLS_REC_DATA, Padding3),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame3)];
-        6 -> [as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, Padding2),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket)];
-        7 -> [TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              as_tls_frame(?TLS_REC_DATA, Padding2),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket)];
-        8 -> [as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              as_tls_frame(?TLS_REC_DATA, Padding2),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, FakeCert),
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData)];
-        9 -> [as_tls_frame(?TLS_REC_DATA, Padding3),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-              TicketRecord,
-              as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-              as_tls_frame(?TLS_REC_DATA, Padding1),
-              as_tls_frame(?TLS_REC_DATA, FakeTicket),
-              as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-              as_tls_frame(?TLS_REC_DATA, FakeCert)];
-        10 -> [as_tls_frame(?TLS_REC_DATA, FakeCert),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-               as_tls_frame(?TLS_REC_DATA, Padding2),
-               TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-               as_tls_frame(?TLS_REC_DATA, Padding1),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-               as_tls_frame(?TLS_REC_DATA, FakeTicket)];
-        11 -> [as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-               as_tls_frame(?TLS_REC_DATA, FakeTicket),
-               as_tls_frame(?TLS_REC_DATA, Padding3),
-               TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, FakeCert),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-               as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-               as_tls_frame(?TLS_REC_DATA, Padding2)];
-        12 -> [as_tls_frame(?TLS_REC_DATA, Padding1),
-               TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-               as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-               as_tls_frame(?TLS_REC_DATA, Padding3),
-               as_tls_frame(?TLS_REC_DATA, FakeCert),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-               as_tls_frame(?TLS_REC_DATA, FakeTicket)];
-        13 -> [as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-               as_tls_frame(?TLS_REC_DATA, Padding2),
-               as_tls_frame(?TLS_REC_DATA, FakeCert),
-               TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-               as_tls_frame(?TLS_REC_DATA, FakeTicket),
-               as_tls_frame(?TLS_REC_DATA, Padding3)];
-        14 -> [TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, Padding3),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-               as_tls_frame(?TLS_REC_DATA, FakeTicket),
-               as_tls_frame(?TLS_REC_DATA, Padding1),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-               as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-               as_tls_frame(?TLS_REC_DATA, FakeCert)];
-        15 -> [as_tls_frame(?TLS_REC_DATA, MimicryFrame3),
-               as_tls_frame(?TLS_REC_DATA, Padding1),
-               as_tls_frame(?TLS_REC_DATA, FakeCert),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-               TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-               as_tls_frame(?TLS_REC_DATA, Padding2),
-               as_tls_frame(?TLS_REC_DATA, FakeTicket)];
-        16 -> [as_tls_frame(?TLS_REC_DATA, FakeTicket),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame1),
-               TicketRecord,
-               as_tls_frame(?TLS_REC_DATA, Padding3),
-               as_tls_frame(?TLS_REC_DATA, MimicryFrame2),
-               as_tls_frame(?TLS_REC_DATA, FakeCert),
-               as_tls_frame(?TLS_REC_DATA, Padding2),
-               as_tls_frame(?TLS_REC_DATA, FakeHttpData)]
-    end,
+    %% ================================================================
+    %% STEALTH: Realistic HTTP/2 initial frames (NOT random garbage)
+    %% Chrome sends these immediately after TLS handshake:
+    %% ================================================================
+    
+    H2Settings = build_h2_settings(),
+    H2WindowUpdate = build_h2_window_update(0, 15663105),
+    H2Headers = build_h2_headers(1),
+    
+    %% Construct realistic initial data sequence
+    %% Order matches what Chrome actually sends
+    DataFrames = [
+        as_tls_frame(?TLS_REC_DATA, H2Settings),
+        as_tls_frame(?TLS_REC_DATA, H2WindowUpdate),
+        TicketRecord,
+        as_tls_frame(?TLS_REC_DATA, H2Headers)
+    ],
 
-    %% Add fake renegotiation if profile supports it
-    FinalDataFrames = case FakeRenegotiation of
-        <<>> -> DataFrames;
-        _ ->
-            RenegFrame = as_tls_frame(?TLS_REC_HANDSHAKE, FakeRenegotiation),
-            Pos = rand:uniform(length(DataFrames)),
-            lists:sublist(DataFrames, Pos - 1) ++ 
-                [RenegFrame] ++ 
-                lists:nthtail(Pos - 1, DataFrames)
-    end,
-
-    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), ChangeCipher | FinalDataFrames],
+    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), ChangeCipher | DataFrames],
 
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
                               HasSessionTicket, HasOcspStapling),
 
-    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), ChangeCipher | FinalDataFrames],
+    Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), ChangeCipher | DataFrames],
 
     Meta = #{
         session_id    => SessionId,
@@ -729,37 +429,24 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         ocsp_response  => OcspResponse
     },
 
-    %% HYPER-NUCLEAR: Initialize chaos state
-    ChaosSt = #chaos_state{
-        frag_min = 200,
-        frag_max = 3000,
-        packet_count = 0,
-        frag_reset_at = rand:uniform(50) + 20,
-        fake_probability = 0.2 + rand:uniform() * 0.3,
-        fake_min_size = 8,
-        fake_max_size = 256,
-        send_jitter_us = rand:uniform(5000),
-        burst_mode = false,
-        burst_count = 0,
-        current_profile = Profile,
-        profile_rotation_count = 0,
-        profile_rotation_at = rand:uniform(200) + 100,
-        entropy_pool = crypto:strong_rand_bytes(128),
-        entropy_threshold = 64,
-        mimicry_mode = http2,
-        mimicry_sequence = [],
+    St = #st{
         session_ticket = SessionTicket,
         ocsp_response = OcspResponse,
         session_ticket_lifetime = case HasSessionTicket of
                                       true -> 604800;
                                       false -> undefined
                                   end,
-        connection_start_time = erlang:system_time(microsecond),
-        bytes_sent = 0,
-        adaptation_level = 1
+        lifecycle = ?LIFECYCLE_WARMUP,
+        packets_sent = 0,
+        lifecycle_change_at = rand:uniform(30) + 20,
+        stream_id = 3,
+        h2_settings_sent = true,
+        current_profile = random_tls_profile(),
+        last_send_time = erlang:system_time(microsecond),
+        inter_packet_gap_us = rand:uniform(5000) + 1000
     },
     
-    {ok, Response, Meta, ChaosSt}.
+    {ok, Response, Meta, St}.
 
 -spec from_client_hello(binary(), binary()) ->
     {ok, iodata(), meta(), codec()}.
@@ -797,7 +484,7 @@ derive_sni_secret(BaseSecret, SniDomain, Salt)
     Derived.
 
 %%%===================================================================
-%%% ClientHello parser (unchanged)
+%%% ClientHello parser
 %%%===================================================================
 
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
@@ -907,13 +594,11 @@ key_size_for_group(16#001D) -> 32;
 key_size_for_group(16#0017) -> 65;
 key_size_for_group(16#0018) -> 97;
 key_size_for_group(16#0019) -> 133;
-key_size_for_group(16#001a) -> 65;
-key_size_for_group(16#001e) -> 56;
 key_size_for_group(16#11EC) -> 1216;
 key_size_for_group(_) -> 32.
 
 %%%===================================================================
-%%% Extension builders (Profile-based)
+%%% Extension builders
 %%%===================================================================
 
 build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
@@ -980,8 +665,7 @@ build_sig_algos(#{sig_algorithms_count := Count}) ->
         16#0203, 16#0804, 16#0805,
         16#0806, 16#0401, 16#0501,
         16#0601, 16#0201, 16#0402,
-        16#0302, 16#0202, 16#0301,
-        16#0807, 16#0808, 16#0809
+        16#0302, 16#0202, 16#0301
     ],
     Selected = lists:sublist(AllAlgos, Count * 2),
     Shuffled = shuffle_list(Selected),
@@ -1070,7 +754,7 @@ make_sni(Domains) ->
       (byte_size(Items)):?u16, Items/binary>>.
 
 %%%===================================================================
-%%% ClientHello generator (unchanged logic)
+%%% ClientHello generator
 %%%===================================================================
 
 -spec make_client_hello(binary(), binary()) -> binary().
@@ -1187,14 +871,6 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
                      _Ticket:TicketLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
-                     Handshake:HSLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16,
-                     Data:DLen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16,
-                     ChangeCipher:CCLen/binary,
-                     Tail/binary>>) ->
-    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
 parse_server_hello(<<16#16, _/binary>> = B) ->
@@ -1216,40 +892,27 @@ tls_records_complete(_B, _N) ->
     false.
 
 %%%===================================================================
-%%% HYPER-NUCLEAR: Chaos Codec with Adaptive Learning
+%%% Data stream codec - Stealth version
 %%%===================================================================
 
 -spec new() -> codec().
 new() ->
-    Profile = random_tls_profile(),
-    #chaos_state{
-        frag_min = 200,
-        frag_max = 3000,
-        packet_count = 0,
-        frag_reset_at = rand:uniform(50) + 20,
-        fake_probability = 0.2 + rand:uniform() * 0.3,
-        fake_min_size = 8,
-        fake_max_size = 256,
-        send_jitter_us = rand:uniform(5000),
-        burst_mode = false,
-        burst_count = 0,
-        current_profile = Profile,
-        profile_rotation_count = 0,
-        profile_rotation_at = rand:uniform(200) + 100,
-        entropy_pool = crypto:strong_rand_bytes(128),
-        entropy_threshold = 64,
-        mimicry_mode = http2,
-        mimicry_sequence = [],
+    #st{
         session_ticket = undefined,
         ocsp_response = undefined,
         session_ticket_lifetime = undefined,
-        connection_start_time = erlang:system_time(microsecond),
-        bytes_sent = 0,
-        adaptation_level = 1
+        lifecycle = ?LIFECYCLE_STEADY,
+        packets_sent = 0,
+        lifecycle_change_at = rand:uniform(50) + 30,
+        stream_id = 1,
+        h2_settings_sent = false,
+        current_profile = random_tls_profile(),
+        last_send_time = erlang:system_time(microsecond),
+        inter_packet_gap_us = rand:uniform(5000) + 1000
     }.
 
--spec try_decode_packet(binary(), codec()) ->
-    {ok, binary(), binary(), codec()} | {incomplete, codec()}.
+-spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
+                                                  | {incomplete, codec()}.
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
@@ -1276,218 +939,113 @@ decode_all(Bin, Acc, St0) ->
     end.
 
 %%%===================================================================
-%%% HYPER-NUCLEAR: encode_packet - The Core Chaos Engine
+%%% STEALTH encode_packet - Realistic traffic patterns
 %%%===================================================================
 
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, #chaos_state{
-    frag_min = FragMin,
-    frag_max = FragMax,
-    packet_count = Count,
-    frag_reset_at = FragResetAt,
-    fake_probability = FakeProb,
-    fake_min_size = FakeMin,
-    fake_max_size = FakeMax,
-    send_jitter_us = JitterUs,
-    burst_mode = BurstMode,
-    burst_count = BurstCount,
-    current_profile = Profile,
-    profile_rotation_count = ProfRotCount,
-    profile_rotation_at = ProfRotAt,
-    entropy_pool = EntropyPool,
-    entropy_threshold = EntropyThresh,
-    mimicry_mode = MimicryMode,
-    mimicry_sequence = MimicrySeq,
-    bytes_sent = BytesSent,
-    adaptation_level = AdaptLevel
+encode_packet(Bin, #st{
+    lifecycle = Lifecycle,
+    packets_sent = PacketsSent,
+    lifecycle_change_at = LifecycleChangeAt,
+    stream_id = StreamId,
+    h2_settings_sent = H2SettingsSent,
+    inter_packet_gap_us = GapUs
 } = St) ->
     
     %% ================================================================
-    %% PHASE 1: Adaptive Parameter Recalculation
+    %% Lifecycle Management (Realistic connection behavior)
     %% ================================================================
     
-    %% Reset fragmentation parameters periodically
-    {NewFragMin, NewFragMax, NewCount, NewFragResetAt, NewAdaptLevel} = 
+    {NewLifecycle, NewChangeAt} = 
         if
-            Count >= FragResetAt ->
-                %% Increase chaos with adaptation level
-                Mult = AdaptLevel * 0.5 + 0.5,
-                NewMin = max(100, round(200 * Mult)),
-                NewMax = min(5000, round(3000 * Mult)),
-                NewReset = rand:uniform(80) + 30,
-                NewAdapt = min(5, AdaptLevel + 1),
-                {NewMin, NewMax, 0, NewReset, NewAdapt};
-            true ->
-                {FragMin, FragMax, Count + 1, FragResetAt, AdaptLevel}
-        end,
-    
-    %% Profile rotation
-    {NewProfile, NewProfRotCount, NewProfRotAt} = 
-        if
-            ProfRotCount >= ProfRotAt ->
-                NewProf = random_tls_profile(),
-                {NewProf, 0, rand:uniform(300) + 100};
-            true ->
-                {Profile, ProfRotCount + 1, ProfRotAt}
-        end,
-    
-    %% Burst mode management - FIXED: moved rand:uniform() outside guard
-    BurstRoll = rand:uniform(),
-    BurstLimitReached = BurstMode andalso (BurstCount >= 5),
-    ShouldEnterBurst = (not BurstMode) andalso (BurstRoll < 0.1),
-    
-    {NewBurstMode, NewBurstCount} = 
-        if
-            BurstLimitReached ->
-                {false, 0};
-            BurstMode ->
-                {true, BurstCount + 1};
-            ShouldEnterBurst ->
-                {true, 0};
-            true ->
-                {false, BurstCount}
-        end,
-    
-    %% ================================================================
-    %% PHASE 2: Entropy Pool Management
-    %% ================================================================
-    
-    {NewEntropyPool, EntropyBytes} = 
-        if
-            byte_size(EntropyPool) < EntropyThresh ->
-                NewPool = crypto:strong_rand_bytes(256),
-                {NewPool, <<>>};
-            true ->
-                <<Used:32/binary, Rest/binary>> = EntropyPool,
-                {Rest, Used}
-        end,
-    
-    %% ================================================================
-    %% PHASE 3: Fragmentation with Chaos
-    %% ================================================================
-    
-    FragSize = case BurstMode of
-        true ->
-            %% Burst mode: tiny fragments
-            FragMin + rand:uniform(min(400, FragMax) - FragMin);
-        false ->
-            FragMin + rand:uniform(FragMax - FragMin)
-    end,
-    
-    Fragments = fragment_data_chaos(Bin, FragSize, EntropyBytes, NewProfile),
-    
-    %% ================================================================
-    %% PHASE 4: Fake Record Injection
-    %% ================================================================
-    
-    %% FIXED: moved rand:uniform() outside guard
-    FakeRoll = rand:uniform(),
-    {FinalFragments, FinalCount} = 
-        case FakeRoll < FakeProb of
-            true ->
-                FakeSize = FakeMin + rand:uniform(FakeMax - FakeMin),
-                FakeData = case rand:uniform(4) of
-                    1 -> build_fake_mimicry_frame(MimicryMode);
-                    2 -> normalize_entropy(crypto:strong_rand_bytes(FakeSize), NewProfile);
-                    3 -> build_fake_padding_record(FakeMin, FakeMax);
-                    4 -> case maps:get(fake_renegotiation, NewProfile, false) of
-                            true -> build_fake_renegotiation();
-                            false -> crypto:strong_rand_bytes(FakeSize)
-                         end
+            PacketsSent >= LifecycleChangeAt ->
+                NewLc = case Lifecycle of
+                    ?LIFECYCLE_WARMUP -> ?LIFECYCLE_STEADY;
+                    ?LIFECYCLE_STEADY ->
+                        case rand:uniform(5) of
+                            1 -> ?LIFECYCLE_BURST;
+                            _ -> ?LIFECYCLE_STEADY
+                        end;
+                    ?LIFECYCLE_BURST -> ?LIFECYCLE_STEADY
                 end,
-                FakeRecord = as_tls_frame(?TLS_REC_DATA, FakeData),
-                Pos = rand:uniform(length(Fragments) + 1),
-                NewFrags = lists:sublist(Fragments, Pos - 1) ++ 
-                           [FakeRecord] ++ 
-                           lists:nthtail(Pos - 1, Fragments),
-                {NewFrags, NewCount + 1};
-            false ->
-                {Fragments, NewCount}
+                {NewLc, PacketsSent + rand:uniform(40) + 20};
+            true ->
+                {Lifecycle, LifecycleChangeAt}
         end,
     
     %% ================================================================
-    %% PHASE 5: Mimicry Mode Rotation
+    %% Build realistic TLS records based on lifecycle
     %% ================================================================
     
-    NewMimicryMode = case rand:uniform(20) of
-        1 -> http2;
-        2 -> grpc;
-        3 -> websocket;
-        _ -> MimicryMode
+    {TlsFrames, NewStreamId, NewH2Sent, NewGapUs} = 
+        case NewLifecycle of
+            ?LIFECYCLE_WARMUP ->
+                %% Warm-up: Send HTTP/2 overhead (SETTINGS, WINDOW_UPDATE)
+                SettingFrame = case H2SettingsSent of
+                    false -> [as_tls_data_frame(build_h2_settings())];
+                    true -> []
+                end,
+                WUFrames = case rand:uniform(3) of
+                    1 -> [as_tls_data_frame(build_h2_window_update(0, 15663105)),
+                          as_tls_data_frame(build_h2_window_update(StreamId, rand:uniform(65535)))];
+                    _ -> []
+                end,
+                PingFrames = case rand:uniform(4) of
+                    1 -> [as_tls_data_frame(build_h2_ping())];
+                    _ -> []
+                end,
+                {SettingFrame ++ WUFrames ++ PingFrames, StreamId + 2, true, 
+                 GapUs + rand:uniform(3000) - 1500};
+            
+            ?LIFECYCLE_STEADY ->
+                %% Steady: Mostly real data, occasional HTTP/2 overhead
+                RealData = as_tls_data_frame(Bin),
+                ExtraFrames = case rand:uniform(8) of
+                    1 -> [as_tls_data_frame(build_h2_ping())];
+                    2 -> [as_tls_data_frame(build_h2_window_update(StreamId, rand:uniform(1048576)))];
+                    _ -> []
+                end,
+                {[RealData | ExtraFrames], StreamId, H2SettingsSent,
+                 GapUs + rand:uniform(2000) - 1000};
+            
+            ?LIFECYCLE_BURST ->
+                %% Burst: Like loading a page - multiple streams, larger windows
+                BurstStreamId = StreamId + 2,
+                RealData = as_tls_data_frame(Bin),
+                H2Headers1 = as_tls_data_frame(build_h2_headers(BurstStreamId)),
+                H2Headers2 = as_tls_data_frame(build_h2_headers(BurstStreamId + 2)),
+                H2Window = as_tls_data_frame(build_h2_window_update(0, 15728640)),
+                {[RealData, H2Headers1, H2Headers2, H2Window], 
+                 BurstStreamId + 4, H2SettingsSent,
+                 GapUs + rand:uniform(1000) - 500}
+        end,
+    
+    %% ================================================================
+    %% Add data frame with actual payload (always)
+    %% ================================================================
+    
+    FinalFrames = case NewLifecycle of
+        ?LIFECYCLE_STEADY -> TlsFrames;  %% Already includes real data
+        _ -> [as_tls_data_frame(Bin) | TlsFrames]  %% Prepend real data
     end,
     
-    %% FIXED: moved rand:uniform() outside guard
-    MimicryRoll = rand:uniform(),
-    NewMimicrySeq = case MimicryRoll < 0.15 of
-        true ->
-            MimicryFrame = build_fake_mimicry_frame(NewMimicryMode),
-            [MimicryFrame | MimicrySeq];
-        false ->
-            MimicrySeq
-    end,
-    
     %% ================================================================
-    %% PHASE 6: Build Final State
+    %% Calculate realistic inter-packet timing (microseconds)
     %% ================================================================
     
-    NewSt = #chaos_state{
-        frag_min = NewFragMin,
-        frag_max = NewFragMax,
-        packet_count = FinalCount,
-        frag_reset_at = NewFragResetAt,
-        fake_probability = FakeProb,
-        fake_min_size = FakeMin,
-        fake_max_size = FakeMax,
-        send_jitter_us = JitterUs,
-        burst_mode = NewBurstMode,
-        burst_count = NewBurstCount,
-        current_profile = NewProfile,
-        profile_rotation_count = NewProfRotCount,
-        profile_rotation_at = NewProfRotAt,
-        entropy_pool = NewEntropyPool,
-        entropy_threshold = EntropyThresh,
-        mimicry_mode = NewMimicryMode,
-        mimicry_sequence = NewMimicrySeq,
-        session_ticket = St#chaos_state.session_ticket,
-        ocsp_response = St#chaos_state.ocsp_response,
-        session_ticket_lifetime = St#chaos_state.session_ticket_lifetime,
-        connection_start_time = St#chaos_state.connection_start_time,
-        bytes_sent = BytesSent + iolist_size(FinalFragments),
-        adaptation_level = NewAdaptLevel
+    FinalGapUs = max(100, min(50000, NewGapUs)),
+    
+    NewSt = St#st{
+        lifecycle = NewLifecycle,
+        packets_sent = PacketsSent + 1,
+        lifecycle_change_at = NewChangeAt,
+        stream_id = NewStreamId,
+        h2_settings_sent = NewH2Sent,
+        last_send_time = erlang:system_time(microsecond),
+        inter_packet_gap_us = FinalGapUs
     },
     
-    {FinalFragments, NewSt}.
-
-%%%===================================================================
-%%% HYPER-NUCLEAR: Chaos Fragmentation with Entropy Injection
-%%%===================================================================
-
-fragment_data_chaos(Bin, FragSize, EntropyBytes, Profile) 
-  when byte_size(Bin) =< FragSize ->
-    %% Mix entropy into the final fragment
-    EnhancedData = case byte_size(EntropyBytes) > 0 of
-        true ->
-            EntropyChunk = binary:part(EntropyBytes, 0, min(byte_size(EntropyBytes), 16)),
-            normalize_entropy(<<Bin/binary, EntropyChunk/binary>>, Profile);
-        false ->
-            normalize_entropy(Bin, Profile)
-    end,
-    [as_tls_data_frame(EnhancedData)];
-fragment_data_chaos(Bin, FragSize, EntropyBytes, Profile) ->
-    <<Chunk:FragSize/binary, Rest/binary>> = Bin,
-    %% FIXED: moved rand:uniform() outside guard
-    ExtraRoll = rand:uniform(),
-    ExtraFrag = case ExtraRoll < 0.1 of
-        true ->
-            ExtraSize = rand:uniform(50) + 10,
-            ExtraData = crypto:strong_rand_bytes(ExtraSize),
-            [as_tls_data_frame(normalize_entropy(ExtraData, Profile))];
-        false ->
-            []
-    end,
-    ExtraFrag ++ 
-    [as_tls_data_frame(normalize_entropy(Chunk, Profile)) | 
-     fragment_data_chaos(Rest, FragSize, EntropyBytes, Profile)].
+    {FinalFrames, NewSt}.
 
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).

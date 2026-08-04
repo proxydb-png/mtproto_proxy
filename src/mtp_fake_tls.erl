@@ -1,7 +1,6 @@
 %%%===================================================================
-%%% Fake TLS with MAXIMUM DPI resistance
-%%% Strategy: Mimic real TLS 1.3 as close as possible
-%%% Added: Certificate chains, session tickets, realistic extensions
+%%% Fake TLS with strong DPI resistance - Final version
+%%% Added: Certificate chain & Session Ticket for MAX evasion
 %%%===================================================================
 
 -module(mtp_fake_tls).
@@ -32,8 +31,7 @@
 -record(st, {
     fragment_size :: pos_integer(),
     packet_count  :: non_neg_integer(),
-    change_frag_at :: non_neg_integer(),
-    session_ticket :: binary() | undefined
+    change_frag_at :: non_neg_integer()
 }).
 
 -record(client_hello, {
@@ -73,6 +71,7 @@
 -define(TLS_TAG_CERTIFICATE, 11).
 -define(TLS_TAG_CERTIFICATE_VERIFY, 15).
 -define(TLS_TAG_FINISHED, 20).
+-define(TLS_TAG_SESSION_TICKET, 4).
 
 -define(TLS_CIPHERSUITE, 192, 47).
 
@@ -147,7 +146,49 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% from_client_hello (server side) - MAX DPI RESISTANCE
+%%% Fake TLS 1.3 handshake messages
+%%%===================================================================
+
+build_encrypted_extensions() ->
+    ALPNs = [<<"h2">>, <<"http/1.1">>],
+    ALPN = lists:nth(rand:uniform(length(ALPNs)), ALPNs),
+    ALPNExt = <<?EXT_ALPN:?u16, (byte_size(ALPN) + 1):?u16,
+                (byte_size(ALPN)):8, ALPN/binary>>,
+    
+    ExtSize = byte_size(ALPNExt),
+    <<ExtSize:?u16, ALPNExt/binary>>.
+
+build_certificate() ->
+    %% Realistic certificate chain size (800-1400 bytes)
+    CertSize = 800 + rand:uniform(600),
+    CertData = crypto:strong_rand_bytes(CertSize),
+    <<0, (byte_size(CertData)):?u24, CertData/binary>>.
+
+build_certificate_verify() ->
+    %% Fake signature (128-256 bytes)
+    SigSize = 128 + rand:uniform(128),
+    <<16#0804:?u16, SigSize:?u16, (crypto:strong_rand_bytes(SigSize))/binary>>.
+
+build_finished() ->
+    %% TLS 1.3 finished message (32 bytes verify data)
+    crypto:strong_rand_bytes(32).
+
+build_session_ticket() ->
+    %% Realistic session ticket
+    Lifetime = 604800 + rand:uniform(86400),
+    AgeAdd = crypto:strong_rand_bytes(4),
+    NonceSize = 16 + rand:uniform(16),
+    Nonce = crypto:strong_rand_bytes(NonceSize),
+    TicketSize = 128 + rand:uniform(128),
+    Ticket = crypto:strong_rand_bytes(TicketSize),
+    
+    <<Lifetime:32, AgeAdd/binary,
+      NonceSize:8, Nonce/binary,
+      TicketSize:?u16, Ticket/binary,
+      0:?u16>>.
+
+%%%===================================================================
+%%% from_client_hello (server side) - WITH CERTIFICATE & TICKET
 %%%===================================================================
 
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -186,29 +227,25 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     KeyShare = make_key_share(Extensions),
 
-    %% --- Build realistic TLS 1.3 server response ---
-    
-    %% ServerHello
+    %% Build TLS 1.3 handshake messages
+    EncryptedExts = build_encrypted_extensions(),
+    Certificate = build_certificate(),
+    CertVerify = build_certificate_verify(),
+    Finished = build_finished(),
+    SessionTicket = build_session_ticket(),
+
+    %% Random fake HTTP data
+    FakeDataSize = 96 + rand:uniform(400),
+    FakeHttpData = crypto:strong_rand_bytes(FakeDataSize),
+
+    ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
+
+    %% Temporary ServerHello for HMAC
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN),
                                SessionId, KeyShare),
-    
-    %% EncryptedExtensions (with realistic extensions)
-    EncryptedExts = build_encrypted_extensions(SniDomain),
-    
-    %% Certificate chain (fake but realistic length)
-    Certificate = build_certificate(SniDomain),
-    
-    %% CertificateVerify (fake signature)
-    CertVerify = build_certificate_verify(),
-    
-    %% Finished (fake verify data)
-    Finished = crypto:strong_rand_bytes(32),
-    
-    %% Session Ticket
-    SessionTicket = build_session_ticket(),
-    
-    %% Build handshake messages
-    Handshake0 = [
+
+    %% Build response with TLS 1.3 messages
+    Response0 = [
         as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
         as_tls_frame(?TLS_REC_HANDSHAKE, [
             <<?TLS_TAG_ENCRYPTED_EXTENSIONS, (iolist_size(EncryptedExts)):?u24>>,
@@ -225,49 +262,19 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         as_tls_frame(?TLS_REC_HANDSHAKE, [
             <<?TLS_TAG_FINISHED, 32:?u24>>,
             Finished
+        ]),
+        ChangeCipher,
+        as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+        as_tls_frame(?TLS_REC_HANDSHAKE, [
+            <<?TLS_TAG_SESSION_TICKET, (iolist_size(SessionTicket)):?u24>>,
+            SessionTicket
         ])
     ],
-    
-    ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
-    
-    %% Fake Application Data
-    FakeDataSize = 96 + rand:uniform(400),
-    FakeHttpData = crypto:strong_rand_bytes(FakeDataSize),
-    
-    %% Randomize order (30% chance to interleave app data)
-    {BeforeCC, AfterCC} = case rand:uniform(10) of
-        N when N =< 3 ->
-            {[], [
-                as_tls_frame(?TLS_REC_HANDSHAKE, [
-                    <<?TLS_TAG_FINISHED, 32:?u24>>,
-                    Finished
-                ]),
-                as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-                ChangeCipher
-            ]};
-        _ ->
-            {[], [
-                as_tls_frame(?TLS_REC_HANDSHAKE, [
-                    <<?TLS_TAG_FINISHED, 32:?u24>>,
-                    Finished
-                ]),
-                ChangeCipher,
-                as_tls_frame(?TLS_REC_DATA, FakeHttpData)
-            ]}
-    end,
-    
-    %% Session Ticket as separate record
-    TicketRecord = as_tls_frame(?TLS_REC_HANDSHAKE, [
-        <<4, (iolist_size(SessionTicket)):?u24>>,
-        SessionTicket
-    ]),
-    
-    Response0 = Handshake0 ++ BeforeCC ++ AfterCC ++ [TicketRecord],
-    
-    %% Calculate real ServerHello digest
+
+    %% Real ServerHello digest
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
-    
+
     Response = [
         as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
         as_tls_frame(?TLS_REC_HANDSHAKE, [
@@ -281,8 +288,18 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         as_tls_frame(?TLS_REC_HANDSHAKE, [
             <<?TLS_TAG_CERTIFICATE_VERIFY, (iolist_size(CertVerify)):?u24>>,
             CertVerify
+        ]),
+        as_tls_frame(?TLS_REC_HANDSHAKE, [
+            <<?TLS_TAG_FINISHED, 32:?u24>>,
+            Finished
+        ]),
+        ChangeCipher,
+        as_tls_frame(?TLS_REC_DATA, FakeHttpData),
+        as_tls_frame(?TLS_REC_HANDSHAKE, [
+            <<?TLS_TAG_SESSION_TICKET, (iolist_size(SessionTicket)):?u24>>,
+            SessionTicket
         ])
-    ] ++ BeforeCC ++ AfterCC ++ [TicketRecord],
+    ],
 
     Meta = #{
         session_id    => SessionId,
@@ -291,62 +308,19 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         sni_domain    => SniDomain
     },
 
-    FragSize = 800 + rand:uniform(1200),
+    FragSize = 1200 + rand:uniform(800),
     ChangeFragAt = rand:uniform(50) + 10,
     
     {ok, Response, Meta, #st{
         fragment_size = FragSize,
         packet_count = 0,
-        change_frag_at = ChangeFragAt,
-        session_ticket = SessionTicket
+        change_frag_at = ChangeFragAt
     }}.
 
 -spec from_client_hello(binary(), binary()) ->
     {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret) ->
     from_client_hello(Data, Secret, []).
-
-%%%===================================================================
-%%% Build realistic TLS 1.3 extensions
-%%%===================================================================
-
-build_encrypted_extensions(SniDomain) ->
-    ALPNs = [<<"h2">>, <<"http/1.1">>, <<"h2">>],
-    ALPN = lists:nth(rand:uniform(length(ALPNs)), ALPNs),
-    ALPNExt = <<?EXT_ALPN:?u16, (byte_size(ALPN) + 1):?u16,
-                (byte_size(ALPN)):8, ALPN/binary>>,
-    
-    SupportedGroups = <<?EXT_SUPPORTED_GROUPS:?u16, 4:?u16, 2:?u16, 16#001d:?u16>>,
-    
-    Extensions = [ALPNExt, SupportedGroups],
-    PaddingSize = 32 + rand:uniform(100),
-    Padding = <<?EXT_PADDING:?u16, PaddingSize:?u16, 0:PaddingSize/unit:8>>,
-    
-    shuffle([Extensions, [Padding]]).
-
-build_certificate(SniDomain) ->
-    %% Build fake but realistic certificate chain
-    CertSize = 800 + rand:uniform(600),
-    CertData = crypto:strong_rand_bytes(CertSize),
-    
-    %% Certificate request context (empty for server)
-    <<0, (byte_size(CertData)):?u24, CertData/binary>>.
-
-build_certificate_verify() ->
-    %% Fake signature (RSA-PSS or ECDSA)
-    SigSize = 128 + rand:uniform(128),
-    <<16#0804:?u16, SigSize:?u16, (crypto:strong_rand_bytes(SigSize))/binary>>.
-
-build_session_ticket() ->
-    Lifetime = 604800 + rand:uniform(86400),
-    AgeAdd = crypto:strong_rand_bytes(4),
-    Nonce = crypto:strong_rand_bytes(16 + rand:uniform(16)),
-    Ticket = crypto:strong_rand_bytes(128 + rand:uniform(128)),
-    
-    <<Lifetime:32, AgeAdd/binary,
-      (byte_size(Nonce)):8, Nonce/binary,
-      (byte_size(Ticket)):?u16, Ticket/binary,
-      0:?u16>>.
 
 %%%===================================================================
 %%% SNI helpers
@@ -448,7 +422,7 @@ make_srv_hello(Digest, SessionId, {Group, Key}) ->
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %%%===================================================================
-%%% ClientHello generator (same as before)
+%%% ClientHello generator
 %%%===================================================================
 
 -spec make_client_hello(binary(), binary()) -> binary().
@@ -473,6 +447,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain)
     Padding           = build_padding(),
     SNI               = make_sni([SniDomain]),
 
+    %% Random optional extensions
     Extra = lists:filtermap(
         fun(_) ->
             case rand:uniform(4) of
@@ -601,26 +576,34 @@ make_sni(Domains) ->
       (byte_size(Items)):?u16, Items/binary>>.
 
 %%%===================================================================
-%%% parse_server_hello - ENHANCED for realistic TLS 1.3
+%%% parse_server_hello - UNCHANGED (working version)
 %%%===================================================================
 
-parse_server_hello(Bin) ->
-    parse_server_hello(Bin, []).
-
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
+                     Handshake:HSLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16,
+                     ChangeCipher:CCLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16,
+                     Data:DLen/binary,
+                     Tail/binary>>) ->
+    {Handshake, ChangeCipher, Data, Tail};
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
+                     Handshake:HSLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16,
+                     Data:DLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16,
+                     ChangeCipher:CCLen/binary,
+                     Tail/binary>>) ->
+    {Handshake, ChangeCipher, Data, Tail};
+%% Skip additional handshake records (Certificate, etc.)
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, Len:?u16,
-                     Handshake:Len/binary, Rest/binary>>, Acc) ->
-    parse_server_hello(Rest, [Handshake | Acc]);
-parse_server_hello(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Len:?u16,
-                     _:Len/binary, Rest/binary>>, Acc) ->
-    parse_server_hello(Rest, Acc);
-parse_server_hello(<<?TLS_REC_DATA, ?TLS_12_VERSION, Len:?u16,
-                     Data:Len/binary, Tail/binary>>, Acc) ->
-    {lists:reverse(Acc), [], Data, Tail};
-parse_server_hello(B, _Acc) when byte_size(B) < 5 ->
+                     _:Len/binary, Rest/binary>>) ->
+    parse_server_hello(Rest);
+parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
-parse_server_hello(<<16#15, _/binary>>, _Acc) ->
+parse_server_hello(<<16#15, _/binary>>) ->
     {error, tls_alert};
-parse_server_hello(_, _Acc) ->
+parse_server_hello(_) ->
     {error, not_proxy_response}.
 
 %%%===================================================================
@@ -634,8 +617,7 @@ new() ->
     #st{
         fragment_size = FragSize,
         packet_count = 0,
-        change_frag_at = ChangeAt,
-        session_ticket = undefined
+        change_frag_at = ChangeAt
     }.
 
 -spec try_decode_packet(binary(), codec()) ->
@@ -674,7 +656,7 @@ encode_packet(Bin, #st{
     {NewFrag, NewCount, NewChangeAt} = 
         if
             Count >= ChangeAt ->
-                NewF = 800 + rand:uniform(1200),
+                NewF = 1200 + rand:uniform(800),
                 NewC = rand:uniform(50) + 10,
                 {NewF, 0, NewC};
             true ->

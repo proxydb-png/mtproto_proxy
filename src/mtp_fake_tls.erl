@@ -222,7 +222,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     },
 
     FragSize = 1200 + rand:uniform(800),
-    ChangeFragAt = rand:uniform(50) + 10,  % Change fragment every 10-60 packets
+    ChangeFragAt = rand:uniform(50) + 10,
     
     {ok, Response, Meta, #st{
         fragment_size = FragSize,
@@ -463,7 +463,7 @@ build_signature_algorithms() ->
         16#0403, 16#0503, 16#0603,
         16#0804, 16#0805, 16#0806,
         16#0401, 16#0501, 16#0601,
-        16#0201, 16#0203              %% Added RSA variants
+        16#0201, 16#0203
     ],
     Shuffled = shuffle(Algs),
     Bin = << <<A:?u16>> || A <- Shuffled >>,
@@ -471,7 +471,6 @@ build_signature_algorithms() ->
       (byte_size(Bin)):?u16, Bin/binary>>.
 
 build_alpn() ->
-    %% Randomize ALPN protocols
     ALPNs = [
         <<3, 2, "h2">>,
         <<8, 7, "http/1.1">>,
@@ -501,7 +500,6 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
                      Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
-%% Support swapped order
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
                      Handshake:HSLen/binary,
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16,
@@ -538,7 +536,6 @@ try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
-%% Handle padding records
 try_decode_packet(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
@@ -565,7 +562,6 @@ encode_packet(Bin, #st{
     packet_count = Count,
     change_frag_at = ChangeAt
 } = St) ->
-    %% Adaptive fragmentation: change fragment size periodically
     {NewFrag, NewCount, NewChangeAt} = 
         if
             Count >= ChangeAt ->
@@ -586,7 +582,8 @@ encode_packet(Bin, #st{
 
 fragment_data(Bin, FragSize) when byte_size(Bin) =< FragSize ->
     as_tls_data_frame(Bin);
-fragment_data(<<Chunk:FragSize/binary, Rest/binary>>, FragSize) ->
+fragment_data(Bin, FragSize) ->
+    <<Chunk:FragSize/binary, Rest/binary>> = Bin,
     [as_tls_data_frame(Chunk) | fragment_data(Rest, FragSize)].
 
 as_tls_data_frame(Bin) ->

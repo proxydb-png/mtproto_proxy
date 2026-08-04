@@ -133,7 +133,7 @@
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [176, 208, 240],
-      session_id_length => {31, 32},  % متغیر برای DPI evasion
+      session_id_length => {31, 32},
       extensions_order_randomized => true,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>],
@@ -179,7 +179,7 @@
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [144, 176],
-      session_id_length => {28, 32},  % متغیر
+      session_id_length => {28, 32},
       extensions_order_randomized => false,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
@@ -218,7 +218,7 @@
       ec_point_formats => false,
       compress_certificate => none,
       ech_payload_size => [208, 240],
-      session_id_length => {0, 32},  % گاهی 0 بایت
+      session_id_length => {0, 32},
       extensions_order_randomized => false,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
@@ -261,7 +261,7 @@
       ec_point_formats => true,
       compress_certificate => brotli,
       ech_payload_size => [176, 208],
-      session_id_length => {24, 32},  % متغیر
+      session_id_length => {24, 32},
       extensions_order_randomized => true,
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>],
@@ -396,9 +396,9 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     FakeHttpData = generate_realistic_http_data(FakeHttpSize),
     
     Response0 = [_, CC, DD] =
-        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+        [as_tls_frame_handshake(SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
+         as_tls_frame_data_with_evasion(FakeHttpData)],
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SrvSessionId, KeyShare),
     
@@ -408,7 +408,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         _ -> []
     end,
     
-    Response = DummyRecords ++ [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
+    Response = DummyRecords ++ [as_tls_frame_handshake(SrvHello),
                 CC,
                 DD],
     Meta0 = #{session_id => SessionId,
@@ -1061,7 +1061,7 @@ encode_with_dpi_evasion(Bin, #st{record_count = Count} = St) ->
     %% Randomize fragment size within range
     FragSize = MinSize + rand:uniform(MaxSize - MinSize),
     
-    {MainFrames, St1} = encode_as_frames_with_padding(Bin, FragSize, St),
+    {MainFrames, St1} = encode_as_frames_with_variable_size(Bin, FragSize, St),
     
     %% Occasionally add dummy records
     DummyProb = rand:uniform(),
@@ -1078,39 +1078,44 @@ encode_with_dpi_evasion(Bin, #st{record_count = Count} = St) ->
     NewCount = Count + 1,
     {AllFrames, St2#st{record_count = NewCount}}.
 
--spec encode_as_frames_with_padding(binary(), non_neg_integer(), #st{}) -> {[iodata()], #st{}}.
-encode_as_frames_with_padding(Bin, MaxSize, St) when byte_size(Bin) =< MaxSize ->
+%% @doc Encode binary into TLS frames with variable size and padding
+-spec encode_as_frames_with_variable_size(binary(), non_neg_integer(), #st{}) -> {[iodata()], #st{}}.
+encode_as_frames_with_variable_size(Bin, MaxSize, St) when byte_size(Bin) =< MaxSize ->
     %% Add random padding to data frames
     PadLen = case rand:uniform(5) of
         1 -> rand:uniform(256);     % Large padding
         _ -> rand:uniform(32)       % Small padding
     end,
     Padding = crypto:strong_rand_bytes(PadLen),
-    {[as_tls_data_frame_with_padding(<<Bin/binary, Padding/binary>>)], St};
-encode_as_frames_with_padding(<<Chunk:MaxSize/binary, Tail/binary>>, MaxSize, St) ->
-    {Frames, St1} = encode_as_frames_with_padding(Tail, MaxSize, St),
+    {[as_tls_frame_data_with_evasion(<<Bin/binary, Padding/binary>>)], St};
+encode_as_frames_with_variable_size(Bin, MaxSize, St) ->
+    %% Split binary into chunks
+    <<Chunk:MaxSize/binary, Tail/binary>> = Bin,
+    {Frames, St1} = encode_as_frames_with_variable_size(Tail, MaxSize, St),
     
     %% Vary padding for each chunk
     PadLen = rand:uniform(64),
     Padding = crypto:strong_rand_bytes(PadLen),
-    {[as_tls_data_frame_with_padding(<<Chunk/binary, Padding/binary>>) | Frames], St1}.
+    {[as_tls_frame_data_with_evasion(<<Chunk/binary, Padding/binary>>) | Frames], St1}.
 
--spec as_tls_data_frame_with_padding(binary()) -> iodata().
-as_tls_data_frame_with_padding(Bin) ->
-    %% Randomize record version occasionally
+%% @doc Create TLS data frame with DPI evasion (random version + padding)
+-spec as_tls_frame_data_with_evasion(binary()) -> iodata().
+as_tls_frame_data_with_evasion(Bin) ->
+    %% Randomize record version
     Version = random_record_version(),
     Size = byte_size(Bin),
     [<<?TLS_REC_DATA, Version/binary, Size:?u16>> | Bin].
 
--spec as_tls_data_frame(binary()) -> iodata().
-as_tls_data_frame(Bin) ->
-    as_tls_frame(?TLS_REC_DATA, Bin).
+%% @doc Create TLS frame for handshake (fixed version for consistency)
+-spec as_tls_frame_handshake(iodata()) -> iodata().
+as_tls_frame_handshake(Data) ->
+    as_tls_frame(?TLS_REC_HANDSHAKE, Data).
 
+%% @doc Create standard TLS frame
 -spec as_tls_frame(byte(), iodata()) -> iodata().
 as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),
-    Version = random_record_version(),
-    [<<Type, Version/binary, Size:?u16>> | Data].
+    [<<Type, ?TLS_12_VERSION, Size:?u16>> | Data].
 
 -if(?OTP_RELEASE >= 23).
 hmac(Algo, Key, Str) ->

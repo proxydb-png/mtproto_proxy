@@ -1,13 +1,7 @@
-%%%-------------------------------------------------------------------
-%%% @author sergey <me@seriyps.ru>
-%%% @copyright (C) 2019, sergey
-%%% @doc
-%%% Fake TLS stream codec with strong DPI resistance.
-%%% Looks like TLS 1.3 from outside, but is not real TLS.
-%%% Enhanced with deep fingerprint randomization, proper GREASE,
-%%% record fragmentation and realistic ClientHello / ServerHello.
-%%% @end
-%%%-------------------------------------------------------------------
+%%%===================================================================
+%%% Fake TLS with strong DPI resistance - Final version
+%%%===================================================================
+
 -module(mtp_fake_tls).
 
 -behaviour(mtp_codec).
@@ -34,16 +28,18 @@
 -dialyzer(no_improper_lists).
 
 -record(st, {
-          fragment_size :: pos_integer()
-         }).
+    fragment_size :: pos_integer(),
+    packet_count  :: non_neg_integer(),
+    change_frag_at :: non_neg_integer()
+}).
 
 -record(client_hello, {
-          pseudorandom       :: binary(),
-          session_id         :: binary(),
-          cipher_suites      :: [non_neg_integer()],
-          compression_methods :: binary(),
-          extensions         :: [{non_neg_integer(), any()}]
-         }).
+    pseudorandom        :: binary(),
+    session_id          :: binary(),
+    cipher_suites       :: [non_neg_integer()],
+    compression_methods :: binary(),
+    extensions          :: [{non_neg_integer(), any()}]
+}).
 
 -define(u16, 16/unsigned-big).
 -define(u24, 24/unsigned-big).
@@ -71,7 +67,7 @@
 -define(TLS_TAG_CLI_HELLO, 1).
 -define(TLS_TAG_SRV_HELLO, 2).
 
--define(TLS_CIPHERSUITE, 192, 47).   %% TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+-define(TLS_CIPHERSUITE, 192, 47).
 
 -define(EXT_SNI,                 0).
 -define(EXT_STATUS_REQUEST,      5).
@@ -94,10 +90,12 @@
 
 -opaque codec() :: #st{}.
 
--type meta() :: #{session_id     := binary(),
-                  timestamp      := non_neg_integer(),
-                  client_digest  := binary(),
-                  sni_domain     => binary()}.
+-type meta() :: #{
+    session_id     := binary(),
+    timestamp      := non_neg_integer(),
+    client_digest  := binary(),
+    sni_domain     => binary()
+}.
 
 %%%===================================================================
 %%% Secret helpers
@@ -146,18 +144,20 @@ match_domain(Domain, Allowed) ->
 %%%===================================================================
 
 -spec from_client_hello(binary(), binary(), [binary()]) ->
-          {ok, iodata(), meta(), codec()}.
+    {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret, AllowedDomains) ->
-    #client_hello{pseudorandom = ClientDigest,
-                  session_id   = SessionId,
-                  extensions   = Extensions} = parse_client_hello(Data),
+    #client_hello{
+        pseudorandom = ClientDigest,
+        session_id   = SessionId,
+        extensions   = Extensions
+    } = parse_client_hello(Data),
 
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
-                    {_, [{0, Domain}]} -> Domain;
-                    _ ->
-                        ?LOG_WARNING("TLS ClientHello has no SNI"),
-                        error({protocol_error, tls_no_sni})
-                end,
+        {_, [{0, Domain}]} -> Domain;
+        _ ->
+            ?LOG_WARNING("TLS ClientHello has no SNI"),
+            error({protocol_error, tls_no_sni})
+    end,
 
     case is_domain_allowed(SniDomain, AllowedDomains) of
         true  -> ok;
@@ -173,22 +173,35 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     lists:all(fun(B) -> B =:= 0 end, binary_to_list(Zeroes))
         orelse error({protocol_error, tls_invalid_digest}),
 
+    % Validate timestamp (5 min window)
+    CurrentTime = erlang:system_time(second),
+    abs(CurrentTime - Timestamp) =< 300
+        orelse error({protocol_error, tls_timestamp_expired}),
+
     KeyShare = make_key_share(Extensions),
 
-    %% Random realistic Application Data size after handshake
-    FakeDataSize = 96 + rand:uniform(400),          %% 96..496 bytes
+    %% Random realistic Application Data size
+    FakeDataSize = 96 + rand:uniform(400),
     FakeHttpData = crypto:strong_rand_bytes(FakeDataSize),
 
-    %% Temporary ServerHello (zero digest) for HMAC calculation
+    %% Temporary ServerHello for HMAC
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN),
                                SessionId, KeyShare),
 
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
 
+    %% Randomize order of ChangeCipher and fake data (20% swapped)
+    {CcFrame, DataFrame} = case rand:uniform(5) of
+        1 ->
+            {as_tls_frame(?TLS_REC_DATA, FakeHttpData), ChangeCipher};
+        _ ->
+            {ChangeCipher, as_tls_frame(?TLS_REC_DATA, FakeHttpData)}
+    end,
+
     Response0 = [
         as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-        ChangeCipher,
-        as_tls_frame(?TLS_REC_DATA, FakeHttpData)
+        CcFrame,
+        DataFrame
     ],
 
     %% Real ServerHello digest
@@ -197,8 +210,8 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 
     Response = [
         as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-        ChangeCipher,
-        as_tls_frame(?TLS_REC_DATA, FakeHttpData)
+        CcFrame,
+        DataFrame
     ],
 
     Meta = #{
@@ -208,11 +221,17 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         sni_domain    => SniDomain
     },
 
-    FragSize = 1200 + rand:uniform(800),            %% 1200..2000
-    {ok, Response, Meta, #st{fragment_size = FragSize}}.
+    FragSize = 1200 + rand:uniform(800),
+    ChangeFragAt = rand:uniform(50) + 10,  % Change fragment every 10-60 packets
+    
+    {ok, Response, Meta, #st{
+        fragment_size = FragSize,
+        packet_count = 0,
+        change_frag_at = ChangeFragAt
+    }}.
 
 -spec from_client_hello(binary(), binary()) ->
-          {ok, iodata(), meta(), codec()}.
+    {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret) ->
     from_client_hello(Data, Secret, []).
 
@@ -259,12 +278,12 @@ parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      ExtensionsLen:?u16, Extensions:ExtensionsLen/binary>>)
   when TlsFrameLen >= 300, HelloLen >= 250 ->
     #client_hello{
-       pseudorandom        = Random,
-       session_id          = SessId,
-       cipher_suites       = [S || <<S:?u16>> <= CipherSuites],
-       compression_methods = CompMethods,
-       extensions          = parse_extensions(Extensions)
-      };
+        pseudorandom        = Random,
+        session_id          = SessId,
+        cipher_suites       = [S || <<S:?u16>> <= CipherSuites],
+        compression_methods = CompMethods,
+        extensions          = parse_extensions(Extensions)
+    };
 parse_client_hello(_Data) ->
     error({protocol_error, tls_bad_client_hello, bad_client_hello}).
 
@@ -293,7 +312,6 @@ make_key_share(Exts) ->
                                      byte_size(Key) >= 32, byte_size(Key) =< 200 ->
             {Group, crypto:strong_rand_bytes(byte_size(Key))};
         _ ->
-            %% Fallback to x25519
             {16#001d, crypto:strong_rand_bytes(32)}
     end.
 
@@ -310,14 +328,14 @@ make_srv_hello(Digest, SessionId, {Group, Key}) ->
           Digest:?DIGEST_LEN/binary,
           SessionSize, SessionId:SessionSize/binary,
           ?TLS_CIPHERSUITE,
-          0,                                          %% compression null
+          0,
           (iolist_size(Extensions)):?u16>>
         | Extensions
     ],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %%%===================================================================
-%%% ClientHello generator (strong DPI resistance)
+%%% ClientHello generator
 %%%===================================================================
 
 -spec make_client_hello(binary(), binary()) -> binary().
@@ -342,15 +360,16 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain)
     Padding           = build_padding(),
     SNI               = make_sni([SniDomain]),
 
-    %% Optional extra extensions (randomly included)
+    %% Random optional extensions
     Extra = lists:filtermap(
-              fun(_) ->
-                      case rand:uniform(3) of
-                          1 -> {true, <<?EXT_EC_POINT_FORMATS:?u16, 2:?u16, 1, 0>>};
-                          2 -> {true, <<?EXT_PSK_KEY_EXCHANGE_MODES:?u16, 2:?u16, 1, 1>>};
-                          _ -> false
-                      end
-              end, [1,2,3]),
+        fun(_) ->
+            case rand:uniform(4) of
+                1 -> {true, <<?EXT_EC_POINT_FORMATS:?u16, 2:?u16, 1, 0>>};
+                2 -> {true, <<?EXT_PSK_KEY_EXCHANGE_MODES:?u16, 2:?u16, 1, 1>>};
+                3 -> {true, <<?EXT_STATUS_REQUEST:?u16, 0:?u16>>};
+                _ -> false
+            end
+        end, [1,2,3,4]),
 
     Extensions0 = [SNI, SupportedGroups, SigAlgos, KeyShare,
                    SupportedVersions, ALPN, Padding | Extra],
@@ -365,14 +384,14 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain)
     TlsLen       = HelloBodyLen + 4,
 
     Pack = fun(FakeRandom) ->
-                   <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
-                     ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
-                     FakeRandom:?DIGEST_LEN/binary,
-                     SessLen, SessionId/binary,
-                     CSLen:?u16, CipherSuites/binary,
-                     1, 0,                                  %% compression methods
-                     ExtLen:?u16, ExtBin/binary>>
-           end,
+        <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
+          ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
+          FakeRandom:?DIGEST_LEN/binary,
+          SessLen, SessionId/binary,
+          CSLen:?u16, CipherSuites/binary,
+          1, 0,
+          ExtLen:?u16, ExtBin/binary>>
+    end,
 
     Hello0     = Pack(binary:copy(<<0>>, ?DIGEST_LEN)),
     Digest     = hmac(sha256, Secret, Hello0),
@@ -393,7 +412,7 @@ random_grease(N) ->
 
 build_cipher_suites() ->
     Base = [
-        16#1301, 16#1302, 16#1303,          %% TLS 1.3
+        16#1301, 16#1302, 16#1303,
         16#c02b, 16#c02f, 16#c02c, 16#c030,
         16#cca9, 16#cca8,
         16#c013, 16#c014,
@@ -404,7 +423,7 @@ build_cipher_suites() ->
     << <<C:?u16>> || C <- All >>.
 
 build_supported_groups() ->
-    Groups = [16#001d, 16#0017, 16#0018],   %% x25519, secp256r1, secp384r1
+    Groups = [16#001d, 16#0017, 16#0018],
     Grease = random_grease(1 + rand:uniform(2)),
     All = shuffle(Groups ++ Grease),
     Bin = << <<G:?u16>> || G <- All >>,
@@ -413,8 +432,8 @@ build_supported_groups() ->
 
 build_key_share() ->
     Real = [
-        {16#001d, 32},                      %% x25519
-        {16#0017, 65}                       %% secp256r1 uncompressed
+        {16#001d, 32},
+        {16#0017, 65}
     ],
     GreaseGroups = random_grease(1 + rand:uniform(1)),
     GreaseEntries = [<<G:?u16, 1:?u16, 0>> || G <- GreaseGroups],
@@ -432,7 +451,7 @@ build_key_share() ->
       (byte_size(Bin)):?u16, Bin/binary>>.
 
 build_supported_versions() ->
-    Versions = [16#0304, 16#0303],          %% TLS 1.3 + 1.2
+    Versions = [16#0304, 16#0303],
     Grease = random_grease(rand:uniform(2)),
     All = shuffle(Versions ++ Grease),
     Bin = << <<V:?u16>> || V <- All >>,
@@ -443,7 +462,8 @@ build_signature_algorithms() ->
     Algs = [
         16#0403, 16#0503, 16#0603,
         16#0804, 16#0805, 16#0806,
-        16#0401, 16#0501, 16#0601
+        16#0401, 16#0501, 16#0601,
+        16#0201, 16#0203              %% Added RSA variants
     ],
     Shuffled = shuffle(Algs),
     Bin = << <<A:?u16>> || A <- Shuffled >>,
@@ -451,11 +471,17 @@ build_signature_algorithms() ->
       (byte_size(Bin)):?u16, Bin/binary>>.
 
 build_alpn() ->
-    %% Prefer h2
-    <<?EXT_ALPN:?u16, 5:?u16, 3, 2, "h2">>.
+    %% Randomize ALPN protocols
+    ALPNs = [
+        <<3, 2, "h2">>,
+        <<8, 7, "http/1.1">>,
+        <<2, 1, "h2", 8, 7, "http/1.1">>
+    ],
+    Proto = lists:nth(rand:uniform(length(ALPNs)), ALPNs),
+    <<?EXT_ALPN:?u16, (byte_size(Proto)):?u16, Proto/binary>>.
 
 build_padding() ->
-    PadLen = 32 + rand:uniform(180),        %% 32..212
+    PadLen = 32 + rand:uniform(180),
     <<?EXT_PADDING:?u16, PadLen:?u16, 0:PadLen/unit:8>>.
 
 make_sni(Domains) ->
@@ -475,6 +501,15 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
                      Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
+%% Support swapped order
+parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16,
+                     Handshake:HSLen/binary,
+                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16,
+                     Data:DLen/binary,
+                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16,
+                     ChangeCipher:CCLen/binary,
+                     Tail/binary>>) ->
+    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
 parse_server_hello(<<16#15, _/binary>>) ->
@@ -483,18 +518,28 @@ parse_server_hello(_) ->
     {error, not_proxy_response}.
 
 %%%===================================================================
-%%% Codec (with fragmentation)
+%%% Codec with adaptive fragmentation
 %%%===================================================================
 
 -spec new() -> codec().
 new() ->
-    #st{fragment_size = 1200 + rand:uniform(800)}.
+    FragSize = 1200 + rand:uniform(800),
+    ChangeAt = rand:uniform(50) + 10,
+    #st{
+        fragment_size = FragSize,
+        packet_count = 0,
+        change_frag_at = ChangeAt
+    }.
 
 -spec try_decode_packet(binary(), codec()) ->
-          {ok, binary(), binary(), codec()} | {incomplete, codec()}.
+    {ok, binary(), binary(), codec()} | {incomplete, codec()}.
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
+                    _Data:Size/binary, Tail/binary>>, St) ->
+    try_decode_packet(Tail, St);
+%% Handle padding records
+try_decode_packet(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
 try_decode_packet(Bin, St) when byte_size(Bin) =< (?MAX_IN_PACKET_SIZE + 5) ->
@@ -515,8 +560,29 @@ decode_all(Bin, Acc, St0) ->
     end.
 
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
-encode_packet(Bin, #st{fragment_size = Frag} = St) ->
-    {fragment_data(Bin, Frag), St}.
+encode_packet(Bin, #st{
+    fragment_size = Frag,
+    packet_count = Count,
+    change_frag_at = ChangeAt
+} = St) ->
+    %% Adaptive fragmentation: change fragment size periodically
+    {NewFrag, NewCount, NewChangeAt} = 
+        if
+            Count >= ChangeAt ->
+                NewF = 1200 + rand:uniform(800),
+                NewC = rand:uniform(50) + 10,
+                {NewF, 0, NewC};
+            true ->
+                {Frag, Count + 1, ChangeAt}
+        end,
+    
+    NewSt = St#st{
+        fragment_size = NewFrag,
+        packet_count = NewCount,
+        change_frag_at = NewChangeAt
+    },
+    
+    {fragment_data(Bin, NewFrag), NewSt}.
 
 fragment_data(Bin, FragSize) when byte_size(Bin) =< FragSize ->
     as_tls_data_frame(Bin);

@@ -5,6 +5,7 @@
 %%% https://github.com/telegramdesktop/tdesktop/commit/69b6b487382c12efc43d52f472cab5954ab850e2
 %%% It's not real TLS, but it looks like TLS1.3 from outside
 %%% Enhanced with deep fingerprint randomization for maximum evasion
+%%% + REALITY-style authentication through Random field
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -33,7 +34,10 @@
 
 -dialyzer(no_improper_lists).
 
--record(st, {}).
+-record(st, {
+    %% REALITY: Session state for additional security
+    session_established = false :: boolean()
+}).
 
 -record(client_hello,
         {pseudorandom :: binary(),
@@ -75,9 +79,32 @@
 -define(EXT_KEY_SHARE, 51).
 -define(EXT_SUPPORTED_VERSIONS, 43).
 
-%% حداکثر اختلاف زمانی مجاز بین Timestamp درون ClientHello و زمان فعلی سرور (به ثانیه)
-%% این مقدار از حملات بازپخش (Replay Attack) جلوگیری می‌کند
+%% ============================================================================
+%% REALITY Authentication Parameters
+%% ============================================================================
+
+%% حداکثر اختلاف زمانی مجاز (به ثانیه) - جلوگیری از Replay Attack
 -define(TIMESTAMP_TOLERANCE_SECONDS, 300).
+
+%% موقعیت‌های بایت در فیلد Random
+%% ساختار فیلد Random (۳۲ بایت):
+%%   [0..10]  = Random data (۱۱ بایت اول - دست‌نخورده)
+%%   [11]     = REALITY magic byte (بایت جادویی)
+%%   [12]     = Version/Flags (نسخه پروتکل)
+%%   [13..28] = Timestamp (۴ بایت) + Random padding (۱۲ بایت)
+%%   [29..31] = Random data (۳ بایت آخر - دست‌نخورده)
+-define(REALITY_MAGIC_OFFSET, 11).
+-define(REALITY_MAGIC_BYTE, 16#A7).  %% بایت جادویی برای تشخیص REALITY
+-define(REALITY_VERSION_OFFSET, 12).
+-define(REALITY_VERSION, 1).          %% نسخه پروتکل REALITY
+-define(REALITY_TIMESTAMP_OFFSET, 13).
+-define(REALITY_TIMESTAMP_SIZE, 4).
+
+%% بررسی ساختار REALITY:
+%% ۱. بایت جادویی در موقعیت ۱۱
+%% ۲. نسخه پروتکل در موقعیت ۱۲
+%% ۳. Timestamp در موقعیت‌های ۱۳-۱۶ (۴ بایت)
+%% ۴. HMAC-SHA256 روی کل ClientHello با Secret مشترک
 
 -define(APP, mtproto_proxy).
 
@@ -269,6 +296,7 @@
 -type meta() :: #{session_id := binary(),
                   timestamp := non_neg_integer(),
                   client_digest := binary(),
+                  reality_version => non_neg_integer(),
                   sni_domain => binary()}.
 
 
@@ -325,15 +353,123 @@ match_domain(Domain, Allowed) ->
     end.
 
 %% ============================================================================
+%% REALITY Authentication - Core Functions
+%% ============================================================================
+
+%% @doc Extract REALITY authentication data from ClientHello Random field.
+%% The Random field in TLS ClientHello is used as a covert channel for
+%% authentication. We embed a magic byte, version, and timestamp in specific
+%% byte positions, then verify the HMAC of the entire ClientHello.
+%%
+%% ساختار فیلد Random (۳۲ بایت) در REALITY:
+%%   Bytes 0-10:   Random data (توسط TLS استاندارد استفاده می‌شود)
+%%   Bytes 11-12:  REALITY signature {magic, version}
+%%   Bytes 13-16:  Unix timestamp (big-endian)
+%%   Bytes 17-28:  Reserved / Random padding
+%%   Bytes 29-31:  Random data (ادامه TLS Random)
+%%
+-spec reality_extract_auth(binary()) -> {ok, non_neg_integer(), binary()} | {error, term()}.
+reality_extract_auth(<<_:?REALITY_MAGIC_OFFSET/binary,
+                        ?REALITY_MAGIC_BYTE:8,
+                        ?REALITY_VERSION:8,
+                        Timestamp:32/unsigned-big,
+                        _Rest/binary>> = Random) ->
+    {ok, Timestamp, Random};
+reality_extract_auth(<<_:?REALITY_MAGIC_OFFSET/binary,
+                        Magic:8,
+                        Version:8,
+                        _Rest/binary>>) ->
+    ?LOG_DEBUG("REALITY auth failed - Magic=~p, Version=~p (expected Magic=~p, Version=~p)",
+               [Magic, Version, ?REALITY_MAGIC_BYTE, ?REALITY_VERSION]),
+    {error, {invalid_reality_signature, Magic, Version}};
+reality_extract_auth(_) ->
+    {error, reality_too_short}.
+
+%% @doc Verify REALITY HMAC authentication.
+%% Computes HMAC-SHA256(Secret, ClientHello_with_zeroed_random) and compares
+%% with the received Random field. A valid client must know the Secret to
+%% compute the correct HMAC.
+-spec reality_verify_hmac(binary(), binary(), binary()) -> 
+    {ok, non_neg_integer()} | {error, term()}.
+reality_verify_hmac(Data, Random, Secret) ->
+    %% Extract the received HMAC from the Random field
+    ReceivedHMAC = Random,
+    
+    %% Compute expected HMAC: Replace Random field with zeros and HMAC
+    {Left, _} = split_binary(Data, ?DIGEST_POS),
+    {_, Right} = split_binary(Data, ?DIGEST_POS + ?DIGEST_LEN),
+    
+    %% Compute HMAC over the message with zeroed Random field
+    ExpectedHMAC = hmac(sha256, Secret, [Left, binary:copy(<<0>>, ?DIGEST_LEN), Right]),
+    
+    %% XOR comparison: Random field should contain HMAC XORed with random padding
+    XorResult = crypto:exor(ReceivedHMAC, ExpectedHMAC),
+    
+    %% Extract timestamp from the XOR result
+    case reality_extract_auth(XorResult) of
+        {ok, Timestamp, _} ->
+            %% Verify timestamp is within tolerance
+            CurrentTime = erlang:system_time(second),
+            case abs(CurrentTime - Timestamp) =< ?TIMESTAMP_TOLERANCE_SECONDS of
+                true ->
+                    {ok, Timestamp};
+                false ->
+                    ?LOG_WARNING(
+                       "REALITY timestamp expired. "
+                       "Current: ~p, Received: ~p, Diff: ~p seconds",
+                       [CurrentTime, Timestamp, abs(CurrentTime - Timestamp)]),
+                    {error, {timestamp_expired, Timestamp, CurrentTime}}
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Full REALITY authentication check.
+%% Combines magic byte verification, version check, and HMAC validation
+%% with timestamp verification.
+-spec reality_authenticate(binary(), binary()) -> 
+    {ok, non_neg_integer(), binary()} | {error, term()}.
+reality_authenticate(Data, Secret) ->
+    #client_hello{pseudorandom = Random} = parse_client_hello(Data),
+    
+    %% Step 1: Verify HMAC and extract timestamp
+    case reality_verify_hmac(Data, Random, Secret) of
+        {ok, Timestamp} ->
+            %% Step 2: Return success with timestamp and client digest
+            {ok, Timestamp, Random};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Create REALITY Random field for ClientHello.
+%% Generates the Random field with embedded authentication data.
+-spec reality_create_random(binary(), binary(), non_neg_integer()) -> binary().
+reality_create_random(Data, Secret, Timestamp) ->
+    {Left, _} = split_binary(Data, ?DIGEST_POS),
+    {_, Right} = split_binary(Data, ?DIGEST_POS + ?DIGEST_LEN),
+    
+    %% Create REALITY structure
+    RealityData = <<0:(?REALITY_MAGIC_OFFSET * 8),    %% 11 bytes padding
+                    ?REALITY_MAGIC_BYTE:8,              %% Magic byte
+                    ?REALITY_VERSION:8,                 %% Version
+                    Timestamp:32/unsigned-big,           %% Timestamp (4 bytes)
+                    0:((?DIGEST_LEN - ?REALITY_TIMESTAMP_OFFSET - ?REALITY_TIMESTAMP_SIZE) * 8)>>,
+    
+    %% Compute HMAC
+    Digest = hmac(sha256, Secret, [Left, RealityData, Right]),
+    
+    %% XOR HMAC with REALITY data to hide it in Random field
+    crypto:exor(Digest, RealityData).
+
+%% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Version WITH domain checking and timestamp validation.
+%% Version WITH domain checking, REALITY authentication, and timestamp validation.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret, AllowedDomains) ->
-    #client_hello{pseudorandom = ClientDigest,
-                  session_id = SessionId,
+    #client_hello{session_id = SessionId,
                   extensions = Extensions} = CliHlo = parse_client_hello(Data),
     ?LOG_DEBUG("TLS ClientHello=~p", [CliHlo]),
 
@@ -361,24 +497,15 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             end
     end,
 
-    ServerDigest = make_server_digest(Data, Secret),
-    <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
-        crypto:exor(ClientDigest, ServerDigest),
-    lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
-        error({protocol_error, tls_invalid_digest, XoredDigest}),
-
-    %% ========================================================================
-    %% بررسی انقضای Timestamp برای جلوگیری از حملات بازپخش (Replay Attack)
-    %% ========================================================================
-    CurrentTime = erlang:system_time(second),
-    abs(CurrentTime - Timestamp) =< ?TIMESTAMP_TOLERANCE_SECONDS
-        orelse begin
-            ?LOG_WARNING(
-               "TLS ClientHello timestamp expired. "
-               "Current: ~p, Received: ~p, Diff: ~p seconds",
-               [CurrentTime, Timestamp, abs(CurrentTime - Timestamp)]),
-            error({protocol_error, tls_timestamp_expired, Timestamp, CurrentTime})
-        end,
+    %% REALITY Authentication
+    {Timestamp, ClientDigest} = case reality_authenticate(Data, Secret) of
+        {ok, Ts, Digest} ->
+            ?LOG_DEBUG("REALITY authentication successful - Timestamp: ~p", [Ts]),
+            {Ts, Digest};
+        {error, Reason} ->
+            ?LOG_WARNING("REALITY authentication failed: ~p", [Reason]),
+            error({protocol_error, tls_auth_failed, Reason})
+    end,
 
     KeyShare = make_key_share(Extensions),
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
@@ -394,9 +521,10 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                 DD],
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
-              client_digest => ClientDigest},
+              client_digest => ClientDigest,
+              reality_version => ?REALITY_VERSION},
     Meta = Meta0#{sni_domain => SniDomain},
-    {ok, Response, Meta, new()}.
+    {ok, Response, Meta, #st{session_established = true}}.
 
 %% ============================================================================
 %% @doc Backward-compatible version without domain checking.
@@ -785,7 +913,7 @@ make_sni(Domains) ->
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
 %% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with random fingerprint.
+%% @doc Generate Fake-TLS "ClientHello" with random fingerprint and REALITY auth.
 %% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
@@ -860,6 +988,8 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     ExtLen = byte_size(ExtBin),
     HelloBodyLen = 2 + 32 + 1 + SessIdLen + 2 + CSLen + 1 + 1 + 2 + ExtLen,
     TlsLen = HelloBodyLen + 4,
+    
+    %% REALITY: Build ClientHello with zeroed Random field first
     Pack = fun(FakeRandom) ->
                    <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
@@ -869,12 +999,13 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
                      1, 0,
                      ExtLen:?u16, ExtBin/binary>>
            end,
+    
+    %% Create ClientHello with zero Random to compute HMAC
     FakeRandom0 = binary:copy(<<0>>, ?DIGEST_LEN),
     Hello0 = Pack(FakeRandom0),
-    Digest = hmac(sha256, Secret, Hello0),
-    EncTimestamp = <<(binary:copy(<<0>>, ?DIGEST_LEN - 4))/binary,
-                     Timestamp:32/unsigned-little>>,
-    FakeRandom = crypto:exor(Digest, EncTimestamp),
+    
+    %% REALITY: Create authentic Random field with embedded auth data
+    FakeRandom = reality_create_random(Hello0, Secret, Timestamp),
     Pack(FakeRandom).
 
 %% ============================================================================
@@ -913,7 +1044,7 @@ tls_records_complete(_B, _N) ->
 
 -spec new() -> codec().
 new() ->
-    #st{}.
+    #st{session_established = false}.
 
 -spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.

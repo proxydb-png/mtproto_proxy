@@ -94,16 +94,12 @@
 
 -define(APP, mtproto_proxy).
 
-%% ============================================================================
-%% Ghost Records - DPI Confusion (from original Secret structure)
-%% ============================================================================
+%% Ghost Records - DPI Confusion
 -define(GHOST_RECORDS_ENABLED, true).
 -define(GHOST_RECORD_COUNT_MIN, 1).
 -define(GHOST_RECORD_COUNT_MAX, 3).
 
-%% ============================================================================
-%% Timing Constants (milliseconds)
-%% ============================================================================
+%% Timing Constants
 -define(GAP_STEADY_MIN, 10).
 -define(GAP_STEADY_MAX, 100).
 -define(GAP_WARMUP_MIN, 5).
@@ -118,9 +114,7 @@
 -define(PROB_BURST_TO_STEADY, 0.3).
 -define(PROB_IDLE_TO_STEADY, 0.1).
 
-%% ============================================================================
 %% GREASE values
-%% ============================================================================
 -define(GREASE_VALUES, [
     16#0a0a, 16#1a1a, 16#2a2a, 16#3a3a, 16#4a4a,
     16#5a5a, 16#6a6a, 16#7a7a, 16#8a8a, 16#9a9a,
@@ -128,9 +122,7 @@
     16#fafa
 ]).
 
-%% ============================================================================
 %% TLS Fingerprint Profiles
-%% ============================================================================
 -define(TLS_FINGERPRINT_PROFILES, [
     #{name => chrome_120,
       cipher_suites => [
@@ -227,9 +219,7 @@
                   session_ticket => binary() | undefined,
                   ocsp_response => binary() | undefined}.
 
-%% ============================================================================
 %% Secret helpers
-%% ============================================================================
 format_secret_hex(Secret, Domain) when byte_size(Secret) == 16 ->
     mtp_handler:hex(<<16#ee, Secret/binary, Domain/binary>>);
 format_secret_hex(HexSecret, Domain) when byte_size(HexSecret) == 32 ->
@@ -248,9 +238,7 @@ urlencode_digit($/) -> $_;
 urlencode_digit($+) -> $-;
 urlencode_digit(D)  -> D.
 
-%% ============================================================================
 %% Domain allow-list
-%% ============================================================================
 -spec is_domain_allowed(binary(), [binary()]) -> boolean().
 is_domain_allowed(_Domain, []) -> true;
 is_domain_allowed(Domain, AllowedDomains) ->
@@ -265,30 +253,22 @@ match_domain(Domain, <<"*.", Base/binary>>) ->
         binary:part(Domain, DomLen - SuffixLen, SuffixLen) =:= Suffix;
 match_domain(Domain, Allowed) -> Domain =:= Allowed.
 
-%% ============================================================================
-%% Ghost Record Generator (DPI Confusion)
-%% ============================================================================
+%% Ghost Record Generator
 -spec build_ghost_record() -> binary().
 build_ghost_record() ->
-    %% Select random record type for ghost
     GhostType = case rand:uniform(4) of
         1 -> ?TLS_REC_HANDSHAKE;
         2 -> ?TLS_REC_DATA;
         3 -> ?TLS_REC_CHANGE_CIPHER;
         4 -> ?TLS_REC_ALERT
     end,
-    
-    %% Random version
     GhostVersion = case rand:uniform(3) of
         1 -> <<?TLS_10_VERSION>>;
         2 -> <<?TLS_12_VERSION>>;
         3 -> <<?TLS_13_VERSION>>
     end,
-    
-    %% Random payload size (small to avoid detection)
     PayloadSize = rand:uniform(64),
     Payload = crypto:strong_rand_bytes(PayloadSize),
-    
     <<GhostType, GhostVersion/binary, PayloadSize:?u16, Payload/binary>>.
 
 -spec generate_ghost_records() -> [binary()].
@@ -296,9 +276,7 @@ generate_ghost_records() ->
     Count = ?GHOST_RECORD_COUNT_MIN + rand:uniform(?GHOST_RECORD_COUNT_MAX - ?GHOST_RECORD_COUNT_MIN + 1),
     [build_ghost_record() || _ <- lists:seq(1, Count)].
 
-%% ============================================================================
 %% REALITY Authentication
-%% ============================================================================
 -spec reality_authenticate(binary(), binary()) -> {ok, non_neg_integer(), binary()} | {error, term()}.
 reality_authenticate(Data, Secret) ->
     #client_hello{pseudorandom = ClientDigest} = parse_client_hello(Data),
@@ -315,9 +293,7 @@ reality_authenticate(Data, Secret) ->
         false -> {error, {invalid_digest, XoredDigest}}
     end.
 
-%% ============================================================================
-%% from_client_hello - با Ghost Records
-%% ============================================================================
+%% from_client_hello
 -spec from_client_hello(binary(), binary(), [binary()]) -> {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret, AllowedDomains) ->
     #client_hello{session_id = SessionId, extensions = Extensions} = CliHlo = parse_client_hello(Data),
@@ -370,23 +346,21 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
 
-    %% Generate Ghost Records for DPI confusion
     GhostRecords = case ?GHOST_RECORDS_ENABLED of
         true -> generate_ghost_records();
         false -> []
     end,
+    TicketRecords = case TicketRecord of <<>> -> []; _ -> [TicketRecord] end,
 
     Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0), ChangeCipher,
-                 as_tls_frame(?TLS_REC_DATA, FakeHttpData) |
-                 case TicketRecord of <<>> -> []; _ -> [TicketRecord] end |
-                 GhostRecords],
+                 as_tls_frame(?TLS_REC_DATA, FakeHttpData)]
+                 ++ TicketRecords ++ GhostRecords,
 
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare, HasSessionTicket, HasOcspStapling),
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello), ChangeCipher,
-                as_tls_frame(?TLS_REC_DATA, FakeHttpData) |
-                case TicketRecord of <<>> -> []; _ -> [TicketRecord] end |
-                GhostRecords],
+                as_tls_frame(?TLS_REC_DATA, FakeHttpData)]
+                ++ TicketRecords ++ GhostRecords,
 
     Meta = #{session_id => SessionId, timestamp => Timestamp, client_digest => ClientDigest,
              sni_domain => SniDomain, session_ticket => SessionTicket, ocsp_response => OcspResponse},
@@ -402,9 +376,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
 -spec from_client_hello(binary(), binary()) -> {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret) -> from_client_hello(Data, Secret, []).
 
-%% ============================================================================
 %% SNI helpers
-%% ============================================================================
 -spec parse_sni(binary()) -> {ok, binary()} | {error, no_sni | bad_hello}.
 parse_sni(Data) ->
     try
@@ -426,9 +398,7 @@ derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 
     <<Derived:16/binary, _/binary>> = crypto:hash(sha256, [Salt, SecretHex, SniDomain]),
     Derived.
 
-%% ============================================================================
 %% ClientHello parser
-%% ============================================================================
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloLen:?u24, ?TLS_12_VERSION,
                      Random:?DIGEST_LEN/binary,
@@ -455,9 +425,7 @@ parse_extension(?EXT_SESSION_TICKET, _Data) -> {session_ticket, supported};
 parse_extension(?EXT_STATUS_REQUEST, <<Type, _Rest/binary>>) -> {ocsp_stapling, Type};
 parse_extension(_Type, Data) -> Data.
 
-%% ============================================================================
 %% ServerHello helpers
-%% ============================================================================
 make_server_digest(<<Left:?DIGEST_POS/binary, _:?DIGEST_LEN/binary, Right/binary>>, Secret) ->
     hmac(sha256, Secret, [Left, binary:copy(<<0>>, ?DIGEST_LEN), Right]).
 
@@ -500,9 +468,7 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, HasSessionTicket
                  (iolist_size(ExtensionsFinal)):?u16>> | ExtensionsFinal],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
-%% ============================================================================
 %% Profile helpers
-%% ============================================================================
 random_tls_profile() ->
     Profiles = ?TLS_FINGERPRINT_PROFILES,
     lists:nth(rand:uniform(length(Profiles)), Profiles).
@@ -521,9 +487,7 @@ key_size_for_group(16#0019) -> 133;
 key_size_for_group(16#11EC) -> 1216;
 key_size_for_group(_) -> 32.
 
-%% ============================================================================
 %% Extension builders
-%% ============================================================================
 build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
     GreaseCount = GreaseMin + rand:uniform(GreaseMax - GreaseMin + 1) - 1,
     GreaseVals = random_grease(GreaseCount),
@@ -626,9 +590,7 @@ make_sni(Domains) ->
     ItemsLen = byte_size(SniListItems),
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
-%% ============================================================================
 %% ClientHello generator
-%% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
     make_client_hello(erlang:system_time(second), crypto:strong_rand_bytes(32), Secret, SniDomain).
@@ -684,9 +646,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     FakeRandom = crypto:exor(Digest, EncTimestamp),
     Pack(FakeRandom).
 
-%% ============================================================================
-%% parse_server_hello - با Ghost Records
-%% ============================================================================
+%% parse_server_hello
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary, Tail/binary>>) ->
@@ -717,9 +677,7 @@ tls_records_complete(<<_T, _Mj, _Mn, Len:?u16, Rest/binary>>, N) when byte_size(
     tls_records_complete(Tail, N - 1);
 tls_records_complete(_B, _N) -> false.
 
-%% ============================================================================
 %% Lifecycle Management
-%% ============================================================================
 update_lifecycle(#st{packet_count = Count, lifecycle = Lifecycle,
                      lifecycle_change_at = ChangeAt, burst_remaining = BurstRemaining} = St) ->
     NewCount = Count + 1,
@@ -751,9 +709,7 @@ update_lifecycle(#st{packet_count = Count, lifecycle = Lifecycle,
     St#st{packet_count = NewCount, lifecycle = NewLifecycle,
           lifecycle_change_at = NewChangeAt, burst_remaining = NewBurstRemaining}.
 
-%% ============================================================================
 %% Data stream codec
-%% ============================================================================
 -spec new() -> codec().
 new() ->
     #st{packet_count = 0, current_profile = random_tls_profile(),
@@ -793,7 +749,6 @@ decode_all(Bin, Acc, St0) ->
 encode_packet(Bin, #st{lifecycle = Lifecycle, padding_enabled = PadEnabled,
                         pad_min = PadMin, pad_max = PadMax, last_send_time = LastSend} = St) ->
 
-    %% Phase 1: Random Padding
     PaddedBin = case PadEnabled of
         true ->
             PadSize = PadMin + rand:uniform(PadMax - PadMin + 1),
@@ -804,7 +759,6 @@ encode_packet(Bin, #st{lifecycle = Lifecycle, padding_enabled = PadEnabled,
         false -> Bin
     end,
 
-    %% Phase 2: Inter-packet delay
     {MinGap, MaxGap} = case Lifecycle of
         warmup -> {?GAP_WARMUP_MIN, ?GAP_WARMUP_MAX};
         burst  -> {?GAP_BURST_MIN, ?GAP_BURST_MAX};
@@ -825,7 +779,6 @@ encode_packet(Bin, #st{lifecycle = Lifecycle, padding_enabled = PadEnabled,
     NewNow = erlang:system_time(millisecond),
     NewSt = update_lifecycle(St#st{last_send_time = NewNow}),
 
-    %% Phase 3: Occasional ghost records
     FinalData = case NewSt#st.lifecycle of
         idle ->
             case rand:uniform(4) of

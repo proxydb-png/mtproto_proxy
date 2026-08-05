@@ -1056,4 +1056,3 @@ hmac(Algo, Key, Str) ->
 hmac(Algo, Key, Str) ->
     crypto:hmac(Algo, Key, Str).
 -endif.
-این درسته

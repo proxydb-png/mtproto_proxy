@@ -1,5 +1,14 @@
 %%%===================================================================
-%%% Fake TLS - SUPERNOVA HYBRID v4.0 (COMPILABLE)
+%%% Fake TLS - SUPERNOVA HYBRID v4.0 (OTP 26+ Compatible)
+%%%===================================================================
+%%% Combines:
+%%% - REALITY-style authentication via Random field
+%%% - Deep fingerprint randomization with browser profiles
+%%% - GREASE techniques for maximum evasion
+%%% - Domain allow-listing and SNI derivation
+%%% - DPI Chaos Engine (from Supernova)
+%%% - Protocol Decoy System (from Supernova)
+%%% - Fragmentation + Jitter (from Supernova)
 %%%===================================================================
 
 -module(mtp_fake_tls).
@@ -332,7 +341,7 @@ match_domain(Domain, Allowed) ->
     Domain =:= Allowed.
 
 %%%===================================================================
-%%% DPI Chaos Engine (NEW)
+%%% DPI Chaos Engine (OTP 26+ Compatible)
 %%%===================================================================
 
 -spec start_dpi_chaos() -> {ok, pid()} | {error, term()}.
@@ -384,25 +393,32 @@ add_decoy_service(Protocol, Trigger, Response) ->
 
 -spec get_chaos_stats() -> map().
 get_chaos_stats() ->
-    case ets:info(?CHAOS_TABLE) of
-        undefined -> #{};
-        _ ->
-            TotalConns = case ets:lookup(?CHAOS_TABLE, total_connections) of
-                [{_, N}] -> N;
-                [] -> 0
-            end,
-            DecoySent = case ets:lookup(?CHAOS_TABLE, decoy_sent) of
-                [{_, N}] -> N;
-                [] -> 0
-            end,
-            #{
-                total_connections => TotalConns,
-                decoy_responses_sent => DecoySent,
-                available_decoys => length(?DECOY_SERVICES)
-            }
+    try
+        case ets:info(?CHAOS_TABLE) of
+            undefined -> 
+                #{};
+            _ ->
+                TotalConns = get_counter_safe(total_connections),
+                DecoySent = get_counter_safe(decoy_sent),
+                #{
+                    total_connections => TotalConns,
+                    decoy_responses_sent => DecoySent,
+                    available_decoys => length(?DECOY_SERVICES)
+                }
+        end
+    catch
+        _:_ -> #{}
+    end.
+
+%% Helper: safe counter retrieval from ETS
+-spec get_counter_safe(atom()) -> non_neg_integer().
+get_counter_safe(Key) ->
+    try ets:lookup_element(?CHAOS_TABLE, Key, 2)
+    catch _:_ -> 0
     end.
 
 %% Internal chaos functions
+-spec chaos_listener(non_neg_integer()) -> no_return().
 chaos_listener(Port) ->
     case gen_tcp:listen(Port, [
         binary,
@@ -419,6 +435,7 @@ chaos_listener(Port) ->
             {error, Reason}
     end.
 
+-spec chaos_accept_loop(port()) -> no_return().
 chaos_accept_loop(ListenSocket) ->
     case gen_tcp:accept(ListenSocket, 60000) of
         {ok, ClientSocket} ->
@@ -426,9 +443,10 @@ chaos_accept_loop(ListenSocket) ->
             spawn(fun() -> chaos_handle_client(ClientSocket) end),
             chaos_accept_loop(ListenSocket);
         {error, timeout} ->
-            case ets:lookup(?CHAOS_TABLE, chaos_enabled) of
-                [{_, true}] -> chaos_accept_loop(ListenSocket);
-                _ -> 
+            IsEnabled = is_chaos_enabled(),
+            case IsEnabled of
+                true -> chaos_accept_loop(ListenSocket);
+                false -> 
                     gen_tcp:close(ListenSocket),
                     ?LOG_INFO("Chaos listener stopped")
             end;
@@ -437,6 +455,13 @@ chaos_accept_loop(ListenSocket) ->
             chaos_accept_loop(ListenSocket)
     end.
 
+-spec is_chaos_enabled() -> boolean().
+is_chaos_enabled() ->
+    try ets:lookup_element(?CHAOS_TABLE, chaos_enabled, 2)
+    catch _:_ -> false
+    end.
+
+-spec chaos_handle_client(port()) -> ok.
 chaos_handle_client(ClientSocket) ->
     try
         inet:setopts(ClientSocket, [{active, false}, {packet, raw}]),
@@ -455,9 +480,11 @@ chaos_handle_client(ClientSocket) ->
         catch gen_tcp:close(ClientSocket)
     end.
 
+-spec is_tls_handshake(binary()) -> boolean().
 is_tls_handshake(<<16#16, 16#03, _/binary>>) -> true;
 is_tls_handshake(_) -> false.
 
+-spec send_tls_decoy(port()) -> ok.
 send_tls_decoy(Socket) ->
     ServerRandom = crypto:strong_rand_bytes(32),
     ServerHello = <<
@@ -476,6 +503,7 @@ send_tls_decoy(Socket) ->
     send_chaos_fragmented(Socket, FakeHttp),
     ok.
 
+-spec send_protocol_decoy(port(), binary()) -> ok.
 send_protocol_decoy(Socket, ClientData) ->
     Decoy = case detect_protocol(ClientData) of
         {ok, Protocol} -> get_random_decoy(Protocol);
@@ -485,6 +513,7 @@ send_protocol_decoy(Socket, ClientData) ->
     send_chaos_fragmented(Socket, Decoy),
     ok.
 
+-spec detect_protocol(binary()) -> {ok, atom()} | unknown.
 detect_protocol(<<16#16, 16#03, _/binary>>) -> {ok, tls};
 detect_protocol(<<"SSH-", _/binary>>) -> {ok, ssh};
 detect_protocol(<<"GET ", _/binary>>) -> {ok, http};
@@ -497,10 +526,12 @@ detect_protocol(<<"+OK", _/binary>>) -> {ok, pop3};
 detect_protocol(<<"PING", _/binary>>) -> {ok, redis};
 detect_protocol(_) -> unknown.
 
+-spec get_random_decoy() -> binary().
 get_random_decoy() ->
     {_, Response} = lists:nth(rand:uniform(length(?DECOY_SERVICES)), ?DECOY_SERVICES),
     Response.
 
+-spec get_random_decoy(atom()) -> binary().
 get_random_decoy(Protocol) ->
     Matching = [{P, R} || {P, R} <- ?DECOY_SERVICES, P =:= Protocol],
     case Matching of
@@ -510,9 +541,11 @@ get_random_decoy(Protocol) ->
             Response
     end.
 
+-spec send_chaos_fragmented(port(), binary()) -> ok.
 send_chaos_fragmented(Socket, Data) ->
     send_chaos_fragmented(Socket, Data, 0).
 
+-spec send_chaos_fragmented(port(), binary(), non_neg_integer()) -> ok.
 send_chaos_fragmented(_Socket, <<>>, _) -> ok;
 send_chaos_fragmented(Socket, Data, Offset) ->
     Remaining = byte_size(Data) - Offset,

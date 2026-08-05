@@ -5,7 +5,6 @@
 %%% https://github.com/telegramdesktop/tdesktop/commit/69b6b487382c12efc43d52f472cab5954ab850e2
 %%% It's not real TLS, but it looks like TLS1.3 from outside
 %%% Enhanced with deep fingerprint randomization for maximum evasion
-%%% REALITY Authentication via Random field
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -75,8 +74,6 @@
 -define(EXT_SNI_HOST_NAME, 0).
 -define(EXT_KEY_SHARE, 51).
 -define(EXT_SUPPORTED_VERSIONS, 43).
--define(EXT_SESSION_TICKET, 35).
--define(EXT_STATUS_REQUEST, 5).
 
 %% حداکثر اختلاف زمانی مجاز بین Timestamp درون ClientHello و زمان فعلی سرور (به ثانیه)
 %% این مقدار از حملات بازپخش (Replay Attack) جلوگیری می‌کند
@@ -272,9 +269,7 @@
 -type meta() :: #{session_id := binary(),
                   timestamp := non_neg_integer(),
                   client_digest := binary(),
-                  sni_domain => binary(),
-                  session_ticket => binary() | undefined,
-                  ocsp_response => binary() | undefined}.
+                  sni_domain => binary()}.
 
 
 %% ============================================================================
@@ -330,45 +325,16 @@ match_domain(Domain, Allowed) ->
     end.
 
 %% ============================================================================
-%% REALITY Authentication via Random field
-%% ============================================================================
-
--spec reality_authenticate(binary(), binary()) -> {ok, non_neg_integer(), binary()}
-                                                    | {error, term()}.
-reality_authenticate(Data, Secret) ->
-    #client_hello{pseudorandom = ClientDigest} = parse_client_hello(Data),
-    ServerDigest = make_server_digest(Data, Secret),
-    <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
-        crypto:exor(ClientDigest, ServerDigest),
-    case lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) of
-        true ->
-            CurrentTime = erlang:system_time(second),
-            case abs(CurrentTime - Timestamp) =< ?TIMESTAMP_TOLERANCE_SECONDS of
-                true ->
-                    {ok, Timestamp, ClientDigest};
-                false ->
-                    ?LOG_WARNING(
-                       "TLS ClientHello timestamp expired. "
-                       "Current: ~p, Received: ~p, Diff: ~p seconds",
-                       [CurrentTime, Timestamp, abs(CurrentTime - Timestamp)]),
-                    {error, {timestamp_expired, Timestamp, CurrentTime}}
-            end;
-        false ->
-            {error, {invalid_digest, XoredDigest}}
-    end.
-
-%% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Version WITH domain checking and REALITY authentication.
+%% Version WITH domain checking and timestamp validation.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret, AllowedDomains) ->
-    #client_hello{
-        session_id = SessionId,
-        extensions = Extensions
-    } = CliHlo = parse_client_hello(Data),
+    #client_hello{pseudorandom = ClientDigest,
+                  session_id = SessionId,
+                  extensions = Extensions} = CliHlo = parse_client_hello(Data),
     ?LOG_DEBUG("TLS ClientHello=~p", [CliHlo]),
 
     %% Extract SNI domain
@@ -395,67 +361,41 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             end
     end,
 
-    %% REALITY Authentication
-    {ok, Timestamp, ClientDigest} = case reality_authenticate(Data, Secret) of
-        {ok, Ts, Digest} -> {ok, Ts, Digest};
-        {error, Reason} ->
-            ?LOG_WARNING("REALITY authentication failed: ~p", [Reason]),
-            error({protocol_error, tls_auth_failed, Reason})
-    end,
+    ServerDigest = make_server_digest(Data, Secret),
+    <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
+        crypto:exor(ClientDigest, ServerDigest),
+    lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
+        error({protocol_error, tls_invalid_digest, XoredDigest}),
 
-    %% Check client capabilities
-    HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
-    HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
+    %% ========================================================================
+    %% بررسی انقضای Timestamp برای جلوگیری از حملات بازپخش (Replay Attack)
+    %% ========================================================================
+    CurrentTime = erlang:system_time(second),
+    abs(CurrentTime - Timestamp) =< ?TIMESTAMP_TOLERANCE_SECONDS
+        orelse begin
+            ?LOG_WARNING(
+               "TLS ClientHello timestamp expired. "
+               "Current: ~p, Received: ~p, Diff: ~p seconds",
+               [CurrentTime, Timestamp, abs(CurrentTime - Timestamp)]),
+            error({protocol_error, tls_timestamp_expired, Timestamp, CurrentTime})
+        end,
 
     KeyShare = make_key_share(Extensions),
-    
-    %% Generate Session Ticket
-    {SessionTicket, TicketRecord} = case HasSessionTicket of
-        true ->
-            Ticket = crypto:strong_rand_bytes(64 + rand:uniform(128)),
-            TicketRec = as_tls_frame(?TLS_REC_HANDSHAKE, Ticket),
-            {Ticket, TicketRec};
-        false ->
-            {undefined, <<>>}
-    end,
-    
-    %% Generate OCSP response
-    OcspResponse = case HasOcspStapling of
-        true -> <<0, 0, 0, 0>>;
-        false -> undefined
-    end,
-
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare,
-                               HasSessionTicket, HasOcspStapling),
-    ChangeCipher = <<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1>>,
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
-    
-    Response0 = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
-                 ChangeCipher,
-                 as_tls_frame(?TLS_REC_DATA, FakeHttpData) |
-                 case TicketRecord of
-                     <<>> -> [];
-                     _ -> [TicketRecord]
-                 end],
-                 
+    Response0 = [_, CC, DD] =
+        [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
+         as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
+         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
-                              HasSessionTicket, HasOcspStapling),
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
-                ChangeCipher,
-                as_tls_frame(?TLS_REC_DATA, FakeHttpData) |
-                case TicketRecord of
-                    <<>> -> [];
-                    _ -> [TicketRecord]
-                end],
-    Meta = #{
-        session_id => SessionId,
-        timestamp => Timestamp,
-        client_digest => ClientDigest,
-        sni_domain => SniDomain,
-        session_ticket => SessionTicket,
-        ocsp_response => OcspResponse
-    },
+                CC,
+                DD],
+    Meta0 = #{session_id => SessionId,
+              timestamp => Timestamp,
+              client_digest => ClientDigest},
+    Meta = Meta0#{sni_domain => SniDomain},
     {ok, Response, Meta, new()}.
 
 %% ============================================================================
@@ -532,10 +472,6 @@ parse_extension(?EXT_SNI, <<ListLen:?u16, List:ListLen/binary>>) ->
 parse_extension(?EXT_KEY_SHARE, <<Len:?u16, Exts:Len/binary>>) ->
     [{Group, Key}
      || <<Group:?u16, KeyLen:?u16, Key:KeyLen/binary>> <= Exts];
-parse_extension(?EXT_SESSION_TICKET, _Data) ->
-    {session_ticket, supported};
-parse_extension(?EXT_STATUS_REQUEST, <<Type, _Rest/binary>>) ->
-    {ocsp_stapling, Type};
 parse_extension(_Type, Data) ->
     Data.
 
@@ -579,31 +515,11 @@ make_key_share(Exts) ->
     end.
 
 make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
-    make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, false, false).
-
-make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, HasSessionTicket, HasOcspStapling) ->
     KeyShareEntity = <<KeyShareGroup:?u16, (byte_size(KeyShareKey)):?u16, KeyShareKey/binary>>,
-    
-    ExtensionsBase = [
-        <<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16>>,
-        KeyShareEntity,
-        <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>
-    ],
-    
-    ExtensionsWithTicket = case HasSessionTicket of
-        true ->
-            ExtensionsBase ++ [<<?EXT_SESSION_TICKET:?u16, 0:?u16>>];
-        false ->
-            ExtensionsBase
-    end,
-    
-    ExtensionsFinal = case HasOcspStapling of
-        true ->
-            ExtensionsWithTicket ++ [<<?EXT_STATUS_REQUEST:?u16, 0:?u16>>];
-        false ->
-            ExtensionsWithTicket
-    end,
-    
+    Extensions =
+        [<<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16>>,
+         KeyShareEntity,
+         <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>],
     SessionSize = byte_size(SessionId),
     Payload = [<<?TLS_12_VERSION,
                  Digest:?DIGEST_LEN/binary,
@@ -611,8 +527,8 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, HasSessionTicket
                  SessionId:SessionSize/binary,
                  ?TLS_CIPHERSUITE,
                  0,
-                 (iolist_size(ExtensionsFinal)):?u16>>
-                   | ExtensionsFinal],
+                 (iolist_size(Extensions)):?u16>>
+                   | Extensions],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %% ============================================================================
@@ -869,7 +785,7 @@ make_sni(Domains) ->
     <<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16, SniListItems/binary>>.
 
 %% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with random fingerprint and REALITY auth.
+%% @doc Generate Fake-TLS "ClientHello" with random fingerprint.
 %% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
@@ -970,12 +886,6 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
-                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
-                     Tail/binary>>) ->
-    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
 parse_server_hello(<<16#16, _/binary>> = B) ->
@@ -1010,9 +920,6 @@ new() ->
 try_decode_packet(<<?TLS_12_DATA, Size:?u16, Data:Size/binary, Tail/binary>>, St) ->
     {ok, Data, Tail, St};
 try_decode_packet(<<?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, Size:?u16,
-                    _Data:Size/binary, Tail/binary>>, St) ->
-    try_decode_packet(Tail, St);
-try_decode_packet(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, Size:?u16,
                     _Data:Size/binary, Tail/binary>>, St) ->
     try_decode_packet(Tail, St);
 try_decode_packet(Bin, St) when byte_size(Bin) =< (?MAX_IN_PACKET_SIZE + 5) ->

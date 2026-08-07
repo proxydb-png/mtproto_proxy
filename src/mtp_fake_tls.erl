@@ -4,14 +4,7 @@
 %%% Fake TLS 'CBC' stream codec
 %%% Enhanced with deep fingerprint randomization, wildcard domain support,
 %%% Replay Attack protection, performance optimizations (iolists, caching),
-%%% and REALISTIC Session Ticket + OCSP Stapling support for Telegram X compatibility.
-%%%
-%%% Key improvements over original:
-%%% - Session Ticket with zero lifetime (prevents client reuse while looking real)
-%%% - Fully structured OCSP Response (looks like real cert validation)
-%%% - Timestamp validation against replay attacks
-%%% - Domain caching for O(1) lookups
-%%% - Pre-computed TLS profiles for ultra-fast ClientHello generation
+%%% and Session Ticket + OCSP Stapling support for Telegram X compatibility.
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -42,11 +35,7 @@
 
 -dialyzer(no_improper_lists).
 
--record(st, {
-    session_ticket :: binary() | undefined,
-    ocsp_response :: binary() | undefined,
-    session_ticket_lifetime :: non_neg_integer() | undefined
-}).
+-record(st, {}).
 
 -record(client_hello,
         {pseudorandom :: binary(),
@@ -80,7 +69,6 @@
 
 -define(TLS_TAG_CLI_HELLO, 1).
 -define(TLS_TAG_SRV_HELLO, 2).
--define(TLS_TAG_NEW_SESSION_TICKET, 4).
 -define(TLS_CIPHERSUITE, 192, 47).
 -define(TLS_CHANGE_CIPHER, ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, 0, 1, 1).
 
@@ -90,9 +78,8 @@
 -define(EXT_SUPPORTED_VERSIONS, 43).
 -define(EXT_SESSION_TICKET, 35).
 -define(EXT_STATUS_REQUEST, 5).
--define(EXT_EARLY_DATA, 42).
 
-%% Maximum allowed time difference between ClientHello timestamp and current server time (seconds)
+%% حداکثر اختلاف زمانی مجاز بین Timestamp درون ClientHello و زمان فعلی سرور (به ثانیه)
 -define(TIMESTAMP_TOLERANCE_SECONDS, 300).
 
 -define(APP, mtproto_proxy).
@@ -146,9 +133,7 @@
           [<<"h2">>],
           [<<"http/1.1">>]
       ],
-      padding_size => {0, 512},
-      session_ticket_enabled => true,
-      ocsp_stapling_enabled => true
+      padding_size => {0, 512}
     },
     #{name => firefox_121,
       cipher_suites => [
@@ -177,9 +162,7 @@
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 256},
-      session_ticket_enabled => true,
-      ocsp_stapling_enabled => false
+      padding_size => {0, 256}
     },
     #{name => safari_17,
       cipher_suites => [
@@ -206,9 +189,7 @@
       alpn_protocols => [
           [<<"h2">>, <<"http/1.1">>]
       ],
-      padding_size => {0, 512},
-      session_ticket_enabled => false,
-      ocsp_stapling_enabled => true
+      padding_size => {0, 512}
     },
     #{name => edge_120,
       cipher_suites => [
@@ -237,9 +218,7 @@
           [<<"h2">>, <<"http/1.1">>],
           [<<"h2">>]
       ],
-      padding_size => {0, 512},
-      session_ticket_enabled => true,
-      ocsp_stapling_enabled => true
+      padding_size => {0, 512}
     }
 ]).
 
@@ -248,9 +227,7 @@
 -type meta() :: #{session_id := binary(),
                   timestamp := non_neg_integer(),
                   client_digest := binary(),
-                  sni_domain => binary(),
-                  session_ticket => binary() | undefined,
-                  ocsp_response => binary() | undefined}.
+                  sni_domain => binary()}.
 
 
 %% ============================================================================
@@ -371,179 +348,8 @@ urlencode_digit($+) -> $-;
 urlencode_digit(D)  -> D.
 
 %% ============================================================================
-%% @doc Encode GeneralizedTime for OCSP (ASN.1 format)
-%% @end
-%% ============================================================================
--spec encode_generalized_time(non_neg_integer()) -> binary().
-encode_generalized_time(Timestamp) ->
-    GregorianSeconds = Timestamp + 62167219200,
-    DateTime = calendar:gregorian_seconds_to_datetime(GregorianSeconds),
-    {{Y, M, D}, {H, Mi, S}} = calendar:universal_time_to_local_time(DateTime),
-    Str = io_lib:format("~4..0w~2..0w~2..0w~2..0w~2..0w~2..0wZ", [Y, M, D, H, Mi, S]),
-    list_to_binary(Str).
-
-%% ============================================================================
-%% @doc Generate a REALISTIC OCSP Response (RFC 6960 / 8446)
-%% Constructs a fully valid ASN.1 DER structure that passes structural
-%% validation in TLS libraries without triggering errors.
-%% @end
-%% ============================================================================
--spec generate_ocsp_response() -> binary().
-generate_ocsp_response() ->
-    %% ================================================================
-    %% 1. OCSPResponseStatus: successful (0)
-    %% ================================================================
-    ResponseStatus = 0,
-
-    %% ================================================================
-    %% 2. ResponderID: byKey (SHA-1 hash of responder's public key)
-    %%    We use a random 20-byte value that looks like a real SHA-1 hash
-    %% ================================================================
-    ResponderIDType = 1,  %% byKey
-    ResponderID = crypto:strong_rand_bytes(20),
-
-    %% ================================================================
-    %% 3. ProducedAt: Current time in GeneralizedTime format
-    %% ================================================================
-    ProducedAt = erlang:system_time(second),
-
-    %% ================================================================
-    %% 4. SingleResponse: Certificate status "good" (0)
-    %%    We construct a realistic CertID structure
-    %% ================================================================
-
-    %% CertID ::= SEQUENCE {
-    %%   hashAlgorithm    AlgorithmIdentifier,
-    %%   issuerNameHash   OCTET STRING,
-    %%   issuerKeyHash    OCTET STRING,
-    %%   serialNumber     CertificateSerialNumber
-    %% }
-    HashAlgorithm = <<16#30, 16#0d, 16#06, 16#09, 16#60, 16#86, 16#48,
-                      16#01, 16#65, 16#03, 16#04, 16#02, 16#01, 16#05,
-                      16#00, 16#04, 16#20>>,
-    IssuerNameHash = crypto:strong_rand_bytes(20),
-    IssuerKeyHash = crypto:strong_rand_bytes(20),
-    SerialNumber = crypto:strong_rand_bytes(16),
-    CertID = <<HashAlgorithm/binary, IssuerNameHash/binary,
-               IssuerKeyHash/binary, SerialNumber/binary>>,
-
-    %% Certificate status: good (0)
-    CertStatus = <<0>>,
-
-    %% Validity period
-    ThisUpdate = ProducedAt - 3600,
-    NextUpdate = ProducedAt + 86400,
-
-    SingleResponse = <<
-        CertID/binary,
-        CertStatus/binary,
-        (encode_generalized_time(ThisUpdate))/binary,
-        (encode_generalized_time(NextUpdate))/binary
-    >>,
-
-    %% ================================================================
-    %% 5. ResponseData: SEQUENCE of SingleResponse(s)
-    %% ================================================================
-    ResponseDataInner = <<
-        0,                                        %% Version (v1)
-        ResponderIDType, ResponderID/binary,     %% ResponderID
-        (encode_generalized_time(ProducedAt))/binary,  %% ProducedAt
-        (byte_size(SingleResponse)):32, SingleResponse/binary,  %% Responses
-        0:?u16                                   %% No extensions
-    >>,
-
-    %% ================================================================
-    %% 6. Signature Algorithm + Signature (random, but valid structure)
-    %% ================================================================
-    SigAlgorithm = <<16#30, 16#0d, 16#06, 16#09, 16#60, 16#86, 16#48,
-                     16#01, 16#65, 16#03, 16#04, 16#02, 16#01, 16#05,
-                     16#00, 16#04, 16#20>>,
-    Signature = crypto:strong_rand_bytes(256),
-
-    %% ================================================================
-    %% 7. BasicOCSPResponse: SEQUENCE
-    %% ================================================================
-    BasicResponse = <<
-        ResponseDataInner/binary,
-        SigAlgorithm/binary,
-        (byte_size(Signature)):?u16, Signature/binary,
-        0:?u16                                    %% No certs
-    >>,
-
-    %% ================================================================
-    %% 8. OCSPResponse: ENUMERATED + BasicOCSPResponse
-    %% ================================================================
-    <<ResponseStatus,
-      (byte_size(BasicResponse)):?u24,
-      BasicResponse/binary>>.
-
-
-%% ============================================================================
-%% @doc Generate a REALISTIC Session Ticket (RFC 5077 / 8446)
-%% KEY INSIGHT: ticket_lifetime = 300 seconds (5 minutes).
-%% This prevents clients from trying to reuse the ticket on subsequent
-%% connections (it expires before they can), while still appearing as a
-%% perfectly valid NewSessionTicket message to any DPI system.
-%%
-%% Additionally, we set max_early_data_size = 0 to explicitly disable 0-RTT,
-%% preventing any client from attempting early data on a resumed connection.
-%% @end
-%% ============================================================================
--spec generate_session_ticket(binary()) -> iodata().
-generate_session_ticket(Secret) ->
-    %% ================================================================
-    %% 1. Ticket Lifetime: 300 seconds (5 minutes)
-    %%    Short enough that no practical client will attempt session
-    %%    resumption, but long enough to look legitimate.
-    %% ================================================================
-    TicketLifetime = 300,
-
-    %% ================================================================
-    %% 2. Ticket Age Add: Random 32-bit value for obfuscation
-    %% ================================================================
-    TicketAgeAdd = crypto:strong_rand_bytes(4),
-
-    %% ================================================================
-    %% 3. Ticket Nonce: Random length (1..255 bytes)
-    %%    TLS 1.3 requires this for uniqueness
-    %% ================================================================
-    NonceLen = 8 + rand:uniform(24),
-    TicketNonce = crypto:strong_rand_bytes(NonceLen),
-
-    %% ================================================================
-    %% 4. Ticket Data: The actual ticket (opaque to client)
-    %%    We embed a connection identifier encrypted with the secret
-    %%    so we can detect replay if needed, plus random padding.
-    %% ================================================================
-    ConnectionId = crypto:strong_rand_bytes(16),
-    %% If a client ever presents this ticket back, we can detect it
-    %% and refuse the connection gracefully.
-    TicketData = crypto:strong_rand_bytes(64 + rand:uniform(128)),
-
-    %% ================================================================
-    %% 5. Extensions: early_data with max_early_data_size = 0
-    %%    This EXPLICITLY tells the client: "You can use this ticket,
-    %%    but you CANNOT send 0-RTT data." This prevents any early data
-    %%    that could confuse our proxy.
-    %% ================================================================
-    EarlyDataExt = <<?EXT_EARLY_DATA:?u16, 4:?u16, 0:32>>,
-
-    Ticket = <<
-        TicketLifetime:32,
-        TicketAgeAdd:4/binary,
-        NonceLen, TicketNonce:NonceLen/binary,
-        (byte_size(TicketData)):?u16, TicketData/binary,
-        (byte_size(EarlyDataExt)):?u16, EarlyDataExt/binary
-    >>,
-
-    %% Build the complete NewSessionTicket handshake message
-    Payload = <<?TLS_TAG_NEW_SESSION_TICKET, (byte_size(Ticket)):?u24, Ticket/binary>>,
-    as_tls_frame(?TLS_REC_HANDSHAKE, Payload).
-
-
-%% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Enhanced with domain checking, timestamp validation, and realistic Session Ticket + OCSP.
+%% Version WITH domain checking, timestamp validation, Session Ticket & OCSP support.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -591,7 +397,7 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         error({protocol_error, tls_invalid_digest, XoredDigest}),
 
     %% ========================================================================
-    %% Replay Attack Protection: Validate timestamp freshness
+    %% بررسی انقضای Timestamp برای جلوگیری از حملات بازپخش (Replay Attack)
     %% ========================================================================
     CurrentTime = erlang:system_time(second),
     abs(CurrentTime - Timestamp) =< ?TIMESTAMP_TOLERANCE_SECONDS
@@ -604,63 +410,24 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         end,
 
     KeyShare = make_key_share(Extensions),
-
-    %% ================================================================
-    %% Generate REALISTIC Session Ticket and OCSP Response
-    %% ================================================================
-    {SessionTicket, TicketRecord} = case HasSessionTicket of
-        true ->
-            Ticket = generate_session_ticket(Secret),
-            {Ticket, Ticket};
-        false ->
-            {undefined, <<>>}
-    end,
-
-    OcspResponse = case HasOcspStapling of
-        true ->
-            generate_ocsp_response();
-        false ->
-            undefined
-    end,
-
-    %% Build initial ServerHello with zero digest (to calculate HMAC)
     SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare,
                                HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
-
-    %% Build response components
-    Response0 = [_, CC, DD, ST] =
+    Response0 = [_, CC, DD] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
-         as_tls_frame(?TLS_REC_DATA, FakeHttpData),
-         TicketRecord],
-
-    %% Calculate proper digest now that we have the full response
+         as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
     SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
                               HasSessionTicket, HasOcspStapling),
-
-    %% Final response with correct digest
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
-                DD,
-                ST],
-
+                DD],
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
               client_digest => ClientDigest},
-    Meta = Meta0#{sni_domain => SniDomain,
-                  session_ticket => SessionTicket,
-                  ocsp_response => OcspResponse},
-
-    St = #st{session_ticket = SessionTicket,
-             ocsp_response = OcspResponse,
-             session_ticket_lifetime = case HasSessionTicket of
-                                          true -> 300;
-                                          false -> undefined
-                                      end},
-
-    {ok, Response, Meta, St}.
+    Meta = Meta0#{sni_domain => SniDomain},
+    {ok, Response, Meta, new()}.
 
 %% ============================================================================
 %% @doc Backward-compatible version without domain checking.
@@ -1136,7 +903,6 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
 
 %% ============================================================================
 %% @doc Parses "ServerHello" (the one produced by from_client_hello/2).
-%% Updated to handle Session Ticket and OCSP responses
 %% @end
 %% ============================================================================
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
@@ -1144,17 +910,10 @@ parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:
                      ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
                      Tail/binary>>) ->
     {Handshake, ChangeCipher, Data, Tail};
-parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
-                     ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
-                     ?TLS_REC_DATA, ?TLS_12_VERSION, DLen:?u16, Data:DLen/binary,
-                     ?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, TicketLen:?u16, _Ticket:TicketLen/binary,
-                     Tail/binary>>) ->
-    %% ServerHello with Session Ticket
-    {Handshake, ChangeCipher, Data, Tail};
 parse_server_hello(B) when byte_size(B) < 5 ->
     incomplete;
 parse_server_hello(<<16#16, _/binary>> = B) ->
-    case tls_records_complete(B, 4) of
+    case tls_records_complete(B, 3) of
         true  -> {error, tls_domain_forwarding};
         false -> incomplete
     end;

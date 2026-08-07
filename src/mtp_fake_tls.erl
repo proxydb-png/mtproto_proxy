@@ -1,5 +1,5 @@
 %%% ============================================================================
-%%% mtp_fake_tls_reality_v3.erl - Reality Hybrid با JA4 Fingerprint Matching
+%%% mtp_fake_tls.erl - Reality Hybrid با JA4 Fingerprint Matching
 %%%
 %%% ویژگی‌ها:
 %%% ۱. JA4 Fingerprint دقیقاً مطابق سرورهای واقعی (Microsoft, Google, Cloudflare, Apple, Amazon)
@@ -12,7 +12,7 @@
 %%% ۸. بدون نیاز به ssl:connect محلی یا سرورهای TLS جداگانه
 %%% ============================================================================
 
--module(mtp_fake_tls_reality_v3).
+-module(mtp_fake_tls).
 
 -behaviour(mtp_codec).
 
@@ -283,7 +283,7 @@ init(AllowedDomains) ->
     },
     put(?CACHE_KEY_DOMAINS, DomainCache),
     put(?CACHE_KEY_CLIENT_HELLO_CACHE, #{}),
-    ?LOG_INFO("Reality Hybrid v3 initialized with ~p profiles", 
+    ?LOG_INFO("Reality Hybrid initialized with ~p profiles", 
               [maps:size(?REALITY_PROFILES)]),
     ok.
 

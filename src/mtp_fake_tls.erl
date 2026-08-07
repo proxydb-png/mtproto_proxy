@@ -31,7 +31,8 @@
 -export([init/1,
          get_performance_report/0,
          select_profile_by_ua/1,
-         random_tls_profile/0]).
+         random_tls_profile/0,
+         make_client_hello_optimized/4]).
 
 -export_type([codec/0, meta/0]).
 
@@ -58,8 +59,8 @@
 -define(u16, 16/unsigned-big).
 -define(u24, 24/unsigned-big).
 
--define(MAX_IN_PACKET_SIZE, 65535).      % sizeof(uint16) - 1
--define(MAX_OUT_PACKET_SIZE, 16384).     % 2^14 https://tools.ietf.org/html/rfc8446#section-5.1
+-define(MAX_IN_PACKET_SIZE, 65535).
+-define(MAX_OUT_PACKET_SIZE, 16384).
 
 -define(TLS_10_VERSION, 3, 1).
 -define(TLS_12_VERSION, 3, 3).
@@ -93,11 +94,14 @@
 -define(APP, mtproto_proxy).
 
 %% ============================================================================
-%% Pre-computed & Cached Data (Domain Sets & TLS Profiles)
+%% Pre-computed & Cached Data
 %% ============================================================================
 -define(CACHE_KEY_DOMAINS, {?MODULE, domain_cache}).
 -define(CACHE_KEY_PROFILES_TAB, {?MODULE, profiles_tab}).
 -define(CACHE_KEY_METRICS, {?MODULE, metrics}).
+-define(HMAC_CACHE, {?MODULE, hmac_cache}).
+-define(HELLO_CACHE, {?MODULE, hello_cache}).
+-define(HELLO_CACHE_SIZE, 1000).
 
 %% ============================================================================
 %% GREASE values for random insertion (RFC 8701)
@@ -110,7 +114,7 @@
 ]).
 
 %% ============================================================================
-%% TLS Fingerprint Profiles - randomized per connection
+%% TLS Fingerprint Profiles
 %% ============================================================================
 
 -define(TLS_FINGERPRINT_PROFILES, [
@@ -338,28 +342,23 @@
                   profile_name => binary()}.
 
 %% ============================================================================
-%% @doc Initialize allowed domains for the proxy.
-%% Parses the list, separates exact and wildcard domains, and caches them.
-%% Also pre-computes all TLS profile data for ultra-fast client hello generation.
-%% @end
+%% init/1
 %% ============================================================================
 -spec init(AllowedDomains :: [binary()]) -> ok.
 init(AllowedDomains) ->
-    %% 1. Domain Caching
+    %% Domain Caching
     {ExactMap, WildcardList} = categorize_domains(AllowedDomains, #{}, []),
     DomainCache = #{exact => ExactMap, wildcard => WildcardList, allowed_list => AllowedDomains},
     put(?CACHE_KEY_DOMAINS, DomainCache),
 
-    %% 2. Profile Pre-computation & ETS Caching
+    %% Profile Pre-computation & ETS Caching
     Profiles = ?TLS_FINGERPRINT_PROFILES,
     PrecomputedProfiles = [precompute_profile(P) || P <- Profiles],
     
-    %% Create ETS table for profiles
     Tab = ets:new(mtp_tls_profiles, [named_table, public, {read_concurrency, true}]),
     [ets:insert(Tab, {N, P}) || {N, P} <- lists:enumerate(PrecomputedProfiles)],
     put(?CACHE_KEY_PROFILES_TAB, Tab),
     
-    %% Initialize metrics
     put(?CACHE_KEY_METRICS, #{}),
     
     ?LOG_INFO("Fake-TLS profiles and domain cache initialized successfully. ~p profiles loaded.",
@@ -367,8 +366,7 @@ init(AllowedDomains) ->
     ok.
 
 %% ============================================================================
-%% @doc Separate domains into exact matches and wildcard suffixes.
-%% @end
+%% categorize_domains/3
 %% ============================================================================
 -spec categorize_domains([binary()], map(), [binary()]) -> {map(), [binary()]}.
 categorize_domains([], ExactMap, Wildcards) ->
@@ -379,9 +377,7 @@ categorize_domains([Domain | T], ExactMap, Wildcards) ->
     categorize_domains(T, maps:put(Domain, true, ExactMap), Wildcards).
 
 %% ============================================================================
-%% @doc Check if a domain is allowed based on the allowed domains list.
-%% Uses cached domain data for O(1) exact lookup and fast wildcard matching.
-%% @end
+%% is_domain_allowed/2
 %% ============================================================================
 -spec is_domain_allowed(Domain :: binary(), AllowedDomains :: [binary()]) -> boolean().
 is_domain_allowed(Domain, AllowedDomains) when is_binary(Domain) ->
@@ -400,9 +396,7 @@ is_domain_allowed(Domain, AllowedDomains) when is_binary(Domain) ->
     end.
 
 %% ============================================================================
-%% @doc Check if a domain ends with any of the allowed wildcard suffixes.
-%% This function correctly handles suffix matching to prevent domain hijacking.
-%% @end
+%% check_wildcard/2
 %% ============================================================================
 -spec check_wildcard(Domain :: binary(), [binary()]) -> boolean().
 check_wildcard(_Domain, []) -> false;
@@ -423,10 +417,7 @@ check_wildcard(Domain, [Suffix | T]) ->
     end.
 
 %% ============================================================================
-%% @doc Pre-compute and cache static parts of a TLS profile.
-%% The returned map contains pre-built binaries and extension templates,
-%% minimizing runtime work during `make_client_hello`.
-%% @end
+%% precompute_profile/1
 %% ============================================================================
 -spec precompute_profile(map()) -> map().
 precompute_profile(Profile) ->
@@ -442,7 +433,7 @@ precompute_profile(Profile) ->
     Profile#{static_extensions => [E || E <- StaticExtensions, E =/= <<>>]}.
 
 %% ============================================================================
-%% @doc format TLS secret
+%% format_secret_hex/2, format_secret_base64/2
 %% ============================================================================
 format_secret_hex(Secret, Domain) when byte_size(Secret) == 16 ->
     mtp_handler:hex(<<16#ee, Secret/binary, Domain/binary>>);
@@ -463,9 +454,7 @@ urlencode_digit($+) -> $-;
 urlencode_digit(D)  -> D.
 
 %% ============================================================================
-%% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Version WITH domain checking and timestamp validation.
-%% @end
+%% from_client_hello/3
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
@@ -475,21 +464,18 @@ from_client_hello(Data, Secret, AllowedDomains) ->
                   extensions = Extensions} = CliHlo = parse_client_hello(Data),
     ?LOG_DEBUG("TLS ClientHello=~p", [CliHlo]),
 
-    %% Extract SNI domain
     SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
         {_, [{?EXT_SNI_HOST_NAME, Domain}]} -> Domain;
         _ -> undefined
     end,
 
-    %% Check if domain is allowed
     case SniDomain of
         undefined ->
             ?LOG_WARNING("TLS ClientHello has no SNI, rejecting"),
             error({protocol_error, tls_no_sni});
         _ ->
             case is_domain_allowed(SniDomain, AllowedDomains) of
-                true ->
-                    ok;
+                true -> ok;
                 false ->
                     ?LOG_WARNING(
                        "TLS ClientHello with unauthorized domain '~s'. "
@@ -505,9 +491,6 @@ from_client_hello(Data, Secret, AllowedDomains) ->
     lists:all(fun(B) -> B == 0 end, binary_to_list(Zeroes)) orelse
         error({protocol_error, tls_invalid_digest, XoredDigest}),
 
-    %% ========================================================================
-    %% بررسی انقضای Timestamp برای جلوگیری از حملات بازپخش (Replay Attack)
-    %% ========================================================================
     CurrentTime = erlang:system_time(second),
     abs(CurrentTime - Timestamp) =< ?TIMESTAMP_TOLERANCE_SECONDS
         orelse begin
@@ -518,11 +501,8 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             error({protocol_error, tls_timestamp_expired, Timestamp, CurrentTime})
         end,
 
-    %% ========================================================================
-    %% Select profile and simulate timing
-    %% ========================================================================
     Profile = select_profile_by_sni(SniDomain),
-    simulate_timing(Profile, processing),
+    simulate_timing(Profile),
     log_profile_selection(Profile, SniDomain),
 
     KeyShare = make_key_share(Extensions),
@@ -543,21 +523,21 @@ from_client_hello(Data, Secret, AllowedDomains) ->
               profile_name => maps:get(name, Profile, unknown)},
     Meta = Meta0#{sni_domain => SniDomain},
     
-    %% Record metrics
     record_performance_metric(handshake_time, erlang:monotonic_time(millisecond)),
     
     {ok, Response, Meta, #st{current_profile = Profile}}.
 
 %% ============================================================================
-%% @doc Backward-compatible version without domain checking.
-%% @end
+%% from_client_hello/2
 %% ============================================================================
 -spec from_client_hello(binary(), binary()) ->
                                {ok, iodata(), meta(), codec()}.
 from_client_hello(Data, Secret) ->
     from_client_hello(Data, Secret, []).
 
-%% Extract the SNI domain from a raw ClientHello binary without validating the secret.
+%% ============================================================================
+%% parse_sni/1
+%% ============================================================================
 -spec parse_sni(binary()) -> {ok, binary()} | {error, no_sni | bad_hello}.
 parse_sni(Data) ->
     try
@@ -573,12 +553,16 @@ parse_sni(Data) ->
             {error, bad_hello}
     end.
 
-%% TLS fatal decode_error alert (RFC 8446 §6).
+%% ============================================================================
+%% tls_decode_error_alert/0
+%% ============================================================================
 -spec tls_decode_error_alert() -> binary().
 tls_decode_error_alert() ->
     <<?TLS_REC_ALERT, ?TLS_12_VERSION, 0, 2, ?TLS_ALERT_FATAL, ?TLS_ALERT_DECODE_ERROR>>.
 
-%% Derive a per-SNI 16-byte secret from the base secret, SNI domain and a salt.
+%% ============================================================================
+%% derive_sni_secret/3
+%% ============================================================================
 -spec derive_sni_secret(BaseSecret :: binary(), SniDomain :: binary(), Salt :: binary())
         -> binary().
 derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 ->
@@ -588,8 +572,7 @@ derive_sni_secret(BaseSecret, SniDomain, Salt) when byte_size(BaseSecret) == 16 
     Derived.
 
 %% ============================================================================
-%% @doc Parse ClientHello with PSK support
-%% @end
+%% parse_client_hello/1
 %% ============================================================================
 parse_client_hello(<<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsFrameLen:?u16,
                      ?TLS_TAG_CLI_HELLO, HelloLen:?u24, ?TLS_12_VERSION,
@@ -635,8 +618,7 @@ parse_extension(_Type, Data) ->
     Data.
 
 %% ============================================================================
-%% @doc Extract PSK from extensions
-%% @end
+%% extract_psk/1, parse_psk_extension/1
 %% ============================================================================
 -spec extract_psk(Extensions :: list()) -> {binary() | undefined, binary() | undefined}.
 extract_psk(Extensions) ->
@@ -664,7 +646,7 @@ parse_psk_extension(<<IdentitiesLen:?u16, IdentitiesData:IdentitiesLen/binary,
 parse_psk_extension(_) -> undefined.
 
 parse_psk_identity(<<IdentityLen:?u16, Identity:IdentityLen/binary, 
-                     Obsolete:4/binary, Rest/binary>>) ->
+                     _Obsolete:4/binary, Rest/binary>>) ->
     {Identity, Rest};
 parse_psk_identity(_) -> undefined.
 
@@ -672,6 +654,9 @@ parse_psk_binder(<<BinderLen:?u16, Binder:BinderLen/binary, Rest/binary>>) ->
     {Binder, Rest};
 parse_psk_binder(_) -> undefined.
 
+%% ============================================================================
+%% make_server_digest/2, make_key_share/1, make_srv_hello/3
+%% ============================================================================
 make_server_digest(<<Left:?DIGEST_POS/binary, _:?DIGEST_LEN/binary, Right/binary>>, Secret) ->
     Msg = [Left, binary:copy(<<0>>, ?DIGEST_LEN), Right],
     hmac(sha256, Secret, Msg).
@@ -687,16 +672,10 @@ make_key_share(Exts) ->
                             andalso
                             lists:member(
                               Group, [
-                                      16#0017,  % secp256r1
-                                      16#0018,  % secp384r1
-                                      16#0019,  % secp521r1
-                                      16#001D,  % x25519
-                                      16#001E,  % x448
-                                      16#0100,  % ffdhe2048
-                                      16#0101,  % ffdhe3072
-                                      16#0102,  % ffdhe4096
-                                      16#0103,  % ffdhe6144
-                                      16#0104   % ffdhe8192
+                                      16#0017, 16#0018, 16#0019,
+                                      16#001D, 16#001E, 16#0100,
+                                      16#0101, 16#0102, 16#0103,
+                                      16#0104
                               ])
                            )
                   end, KeyShares),
@@ -728,14 +707,12 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %% ============================================================================
-%% @doc Randomly select a precomputed TLS fingerprint profile from ETS.
-%% @end
+%% random_tls_profile/0
 %% ============================================================================
 -spec random_tls_profile() -> map().
 random_tls_profile() ->
     case get(?CACHE_KEY_PROFILES_TAB) of
         undefined ->
-            %% Fallback to hardcoded profiles
             Profiles = ?TLS_FINGERPRINT_PROFILES,
             lists:nth(rand:uniform(length(Profiles)), Profiles);
         Tab ->
@@ -752,8 +729,7 @@ random_tls_profile() ->
     end.
 
 %% ============================================================================
-%% @doc Select profile based on SNI domain
-%% @end
+%% select_profile_by_sni/1, select_profile_by_ua/1
 %% ============================================================================
 -spec select_profile_by_sni(binary()) -> map().
 select_profile_by_sni(SniDomain) ->
@@ -770,10 +746,6 @@ select_profile_by_sni(SniDomain) ->
             end
     end.
 
-%% ============================================================================
-%% @doc Select profile based on User-Agent
-%% @end
-%% ============================================================================
 -spec select_profile_by_ua(UserAgent :: binary()) -> map().
 select_profile_by_ua(UserAgent) ->
     case binary:match(UserAgent, <<"Chrome">>) of
@@ -802,19 +774,17 @@ get_profile(Name) ->
     lists:keyfind(Name, name, ?TLS_FINGERPRINT_PROFILES).
 
 %% ============================================================================
-%% @doc Simulate realistic timing based on profile
-%% @end
+%% simulate_timing/1
 %% ============================================================================
--spec simulate_timing(Profile :: map(), Action :: atom()) -> ok.
-simulate_timing(Profile, Action) ->
+-spec simulate_timing(Profile :: map()) -> ok.
+simulate_timing(Profile) ->
     BaseDelay = maps:get(timing_base_delay, Profile, 50),
-    Jitter = rand:uniform(BaseDelay div 5),
+    Jitter = rand:uniform(BaseDelay div 5 + 1),
     Delay = BaseDelay + Jitter - (Jitter div 2),
     timer:sleep(Delay).
 
 %% ============================================================================
-%% @doc Log profile selection
-%% @end
+%% log_profile_selection/2
 %% ============================================================================
 -spec log_profile_selection(Profile :: map(), SniDomain :: binary()) -> ok.
 log_profile_selection(Profile, SniDomain) ->
@@ -824,8 +794,7 @@ log_profile_selection(Profile, SniDomain) ->
                maps:get(extensions_order_randomized, Profile, false)]).
 
 %% ============================================================================
-%% @doc Record performance metrics
-%% @end
+%% record_performance_metric/2, get_performance_report/0
 %% ============================================================================
 -spec record_performance_metric(Name :: atom(), Value :: integer()) -> ok.
 record_performance_metric(Name, Value) ->
@@ -839,10 +808,6 @@ record_performance_metric(Name, Value) ->
         Metrics),
     put(?CACHE_KEY_METRICS, NewMetrics).
 
-%% ============================================================================
-%% @doc Get performance report
-%% @end
-%% ============================================================================
 -spec get_performance_report() -> map().
 get_performance_report() ->
     case get(?CACHE_KEY_METRICS) of
@@ -857,17 +822,12 @@ get_performance_report() ->
     end.
 
 %% ============================================================================
-%% @doc Generate random GREASE values
-%% @end
+%% random_grease/1, shuffle_list/1
 %% ============================================================================
 -spec random_grease(non_neg_integer()) -> [non_neg_integer()].
 random_grease(Count) ->
     [lists:nth(rand:uniform(length(?GREASE_VALUES)), ?GREASE_VALUES) || _ <- lists:seq(1, Count)].
 
-%% ============================================================================
-%% @doc Fisher-Yates shuffle for lists
-%% @end
-%% ============================================================================
 -spec shuffle_list(list()) -> list().
 shuffle_list([]) -> [];
 shuffle_list(List) ->
@@ -875,8 +835,23 @@ shuffle_list(List) ->
     [X || {_, X} <- Sorted].
 
 %% ============================================================================
-%% @doc Build cipher suites binary with GREASE and optional order randomization
-%% @end
+%% fast_shuffle/1 - بهینه‌شده
+%% ============================================================================
+-spec fast_shuffle(list()) -> list().
+fast_shuffle(List) when length(List) =< 30 ->
+    shuffle_list(List);
+fast_shuffle(List) ->
+    Len = length(List),
+    case Len > 100 of
+        true ->
+            {First, Rest} = lists:split(Len div 5, List),
+            shuffle_list(First) ++ Rest;
+        false ->
+            shuffle_list(List)
+    end.
+
+%% ============================================================================
+%% build_cipher_suites/1, build_cipher_suites_fast/1
 %% ============================================================================
 -spec build_cipher_suites(map()) -> iodata().
 build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, GreaseMax}} = Profile) ->
@@ -890,7 +865,7 @@ build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, Greas
         end, Suites, GreaseVals),
     
     Final = case maps:get(cipher_order_randomized, Profile, false) of
-        true -> shuffle_list(WithGrease);
+        true -> fast_shuffle(WithGrease);
         false -> WithGrease
     end,
 
@@ -898,8 +873,7 @@ build_cipher_suites(#{cipher_suites := Suites, grease_count := {GreaseMin, Greas
     [<<CSLen:?u16>>, << <<S:?u16>> || S <- Final >>].
 
 %% ============================================================================
-%% @doc Build key share entries with GREASE
-%% @end
+%% build_key_share_entries/1
 %% ============================================================================
 -spec build_key_share_entries(map()) -> iodata().
 build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
@@ -926,20 +900,18 @@ build_key_share_entries(#{key_share_groups := Groups, grease_count := {GreaseMin
     iolist_to_binary(AllEntries).
 
 %% ============================================================================
-%% @doc Get key size for a given TLS group
-%% @end
+%% key_size_for_group/1
 %% ============================================================================
 -spec key_size_for_group(non_neg_integer()) -> non_neg_integer().
-key_size_for_group(16#001D) -> 32;    % x25519
-key_size_for_group(16#0017) -> 65;    % secp256r1 (uncompressed)
-key_size_for_group(16#0018) -> 97;    % secp384r1
-key_size_for_group(16#0019) -> 133;   % secp521r1
-key_size_for_group(16#11EC) -> 1216;  % X25519MLKEM768
+key_size_for_group(16#001D) -> 32;
+key_size_for_group(16#0017) -> 65;
+key_size_for_group(16#0018) -> 97;
+key_size_for_group(16#0019) -> 133;
+key_size_for_group(16#11EC) -> 1216;
 key_size_for_group(_) -> 32.
 
 %% ============================================================================
-%% @doc Build supported versions extension with GREASE
-%% @end
+%% build_supported_versions_ext/1
 %% ============================================================================
 -spec build_supported_versions_ext(map()) -> iolist().
 build_supported_versions_ext(#{supported_versions := Versions, 
@@ -954,15 +926,14 @@ build_supported_versions_ext(#{supported_versions := Versions,
         end, Versions, GreaseVals),
     
     Final = case maps:get(version_order_randomized, Profile, false) of
-        true -> shuffle_list(WithGrease);
+        true -> fast_shuffle(WithGrease);
         false -> WithGrease
     end,
     
     << <<V:?u16>> || V <- Final >>.
 
 %% ============================================================================
-%% @doc Build signature algorithms extension from profile
-%% @end
+%% build_sig_algos/1
 %% ============================================================================
 -spec build_sig_algos(map()) -> iodata().
 build_sig_algos(#{sig_algorithms_count := Count}) ->
@@ -973,15 +944,14 @@ build_sig_algos(#{sig_algorithms_count := Count}) ->
         16#04, 16#02, 16#03, 16#02, 16#02, 16#02, 16#03, 16#01
     ],
     Selected = lists:sublist(AllAlgos, Count * 2),
-    Shuffled = shuffle_list(Selected),
+    Shuffled = fast_shuffle(Selected),
     AlgoListLen = Count * 2,
     ExtLen = AlgoListLen + 2,
     [<<16#00, 16#0d, ExtLen:?u16, AlgoListLen:?u16>>,
      << <<A:8>> || A <- Shuffled >>].
 
 %% ============================================================================
-%% @doc Build ECH extension from profile
-%% @end
+%% build_ech/1, build_alpn/1
 %% ============================================================================
 -spec build_ech(map()) -> iodata().
 build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
@@ -1000,10 +970,6 @@ build_ech(#{ech_payload_size := Sizes}) when is_list(Sizes) ->
 build_ech(_) ->
     <<>>.
 
-%% ============================================================================
-%% @doc Build ALPN extension from profile
-%% @end
-%% ============================================================================
 -spec build_alpn(map()) -> iodata().
 build_alpn(#{alpn_protocols := Protocols}) ->
     Selected = lists:nth(rand:uniform(length(Protocols)), Protocols),
@@ -1014,8 +980,7 @@ build_alpn(_) ->
     <<>>.
 
 %% ============================================================================
-%% @doc Build static extensions (precomputed in profile)
-%% @end
+%% Static Extensions
 %% ============================================================================
 ec_point_formats_ext(#{ec_point_formats := true}) ->
     <<16#00, 16#0b, 16#00, 16#02, 16#01, 16#00>>;
@@ -1041,8 +1006,7 @@ status_request_ext() ->
     <<16#00, 16#05, 16#00, 16#05, 16#01, 0:32>>.
 
 %% ============================================================================
-%% @doc Build supported_groups extension
-%% @end
+%% build_supported_groups/1
 %% ============================================================================
 -spec build_supported_groups(map()) -> iodata().
 build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin, GreaseMax}}) ->
@@ -1060,8 +1024,7 @@ build_supported_groups(#{key_share_groups := Groups, grease_count := {GreaseMin,
     [<<16#00, 16#0a, (GroupsLen + 2):?u16, GroupsLen:?u16>>, GroupsBin].
 
 %% ============================================================================
-%% @doc Build random padding extension
-%% @end
+%% build_padding/1
 %% ============================================================================
 -spec build_padding(map()) -> iodata().
 build_padding(#{padding_size := {Min, Max}}) ->
@@ -1076,8 +1039,7 @@ build_padding(_) ->
     <<>>.
 
 %% ============================================================================
-%% @doc Build SNI extension
-%% @end
+%% make_sni/1, make_client_hello/2, make_client_hello/4
 %% ============================================================================
 make_sni(Domains) ->
     SniListItems = [<<?EXT_SNI_HOST_NAME, (byte_size(Domain)):?u16, Domain/binary>>
@@ -1085,38 +1047,6 @@ make_sni(Domains) ->
     ItemsLen = iolist_size(SniListItems),
     [<<?EXT_SNI:?u16, (ItemsLen + 2):?u16, ItemsLen:?u16>> | SniListItems].
 
-%% ============================================================================
-%% @doc Build PSK extension
-%% @end
-%% ============================================================================
--spec build_psk_extension(binary(), binary(), binary(), non_neg_integer()) -> iodata().
-build_psk_extension(Identity, Secret, SessionId, Timestamp) ->
-    IdentityLen = byte_size(Identity),
-    ObsoleteAge = 0,
-    
-    Binder = compute_psk_binder(Secret, SessionId, Timestamp, Identity),
-    BinderLen = byte_size(Binder),
-    
-    IdentitiesData = <<IdentityLen:?u16, Identity/binary, ObsoleteAge:32/unsigned>>,
-    IdentitiesLen = byte_size(IdentitiesData),
-    BindersData = <<BinderLen:?u16, Binder/binary>>,
-    BindersLen = byte_size(BindersData),
-    
-    ExtData = <<IdentitiesLen:?u16, IdentitiesData/binary,
-                BindersLen:?u16, BindersData/binary>>,
-    ExtLen = byte_size(ExtData),
-    
-    <<?EXT_PSK:?u16, ExtLen:?u16, ExtData/binary>>.
-
-compute_psk_binder(Secret, SessionId, Timestamp, Identity) ->
-    Context = <<SessionId/binary, Timestamp:32/unsigned-little, Identity/binary>>,
-    crypto:mac(hmac, sha256, Secret, Context).
-
-%% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with random fingerprint.
-%% Uses precomputed profiles for maximum performance.
-%% @end
-%% ============================================================================
 -spec make_client_hello(binary(), binary()) -> binary().
 make_client_hello(Secret, SniDomain) ->
     make_client_hello(erlang:system_time(second),
@@ -1129,7 +1059,28 @@ make_client_hello(Timestamp, SessionId, HexSecret, SniDomain) when byte_size(Hex
 make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(SessionId) == 32,
                                                                 byte_size(Secret) == 16 ->
     Profile = random_tls_profile(),
+    build_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile).
 
+%% ============================================================================
+%% make_client_hello_optimized/4
+%% ============================================================================
+-spec make_client_hello_optimized(non_neg_integer(), binary(), binary(), binary()) -> binary().
+make_client_hello_optimized(Timestamp, SessionId, Secret, SniDomain) ->
+    case get_cached_hello(Secret, SniDomain) of
+        undefined ->
+            Profile = random_tls_profile(),
+            Hello = build_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile),
+            cache_hello(Secret, SniDomain, Hello),
+            Hello;
+        Cached ->
+            update_hello_timestamp(Cached, Timestamp)
+    end.
+
+%% ============================================================================
+%% build_client_hello/5 - تابع کمکی
+%% ============================================================================
+-spec build_client_hello(non_neg_integer(), binary(), binary(), binary(), map()) -> binary().
+build_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile) ->
     CipherSuites = build_cipher_suites(Profile),
     SNI = make_sni([SniDomain]),
     SigAlgos = build_sig_algos(Profile),
@@ -1165,7 +1116,7 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
 
     NonEmpty = [E || E <- ExtensionsBase, E =/= <<>>],
     Extensions = case maps:get(extensions_order_randomized, Profile, false) of
-        true -> shuffle_list(NonEmpty);
+        true -> fast_shuffle(NonEmpty);
         false -> NonEmpty
     end,
 
@@ -1175,15 +1126,17 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     ExtLen = byte_size(ExtBin),
     HelloBodyLen = 2 + 32 + 1 + SessIdLen + CSLen + 1 + 1 + 2 + ExtLen,
     TlsLen = HelloBodyLen + 4,
+    
     Pack = fun(FakeRandom) ->
-                   <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
-                     ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
-                     FakeRandom:?DIGEST_LEN/binary,
-                     SessIdLen, SessionId/binary,
-                     (iolist_to_binary(CipherSuites))/binary,
-                     1, 0,
-                     ExtLen:?u16, ExtBin/binary>>
-           end,
+        <<?TLS_REC_HANDSHAKE, ?TLS_10_VERSION, TlsLen:?u16,
+          ?TLS_TAG_CLI_HELLO, HelloBodyLen:?u24, ?TLS_12_VERSION,
+          FakeRandom:?DIGEST_LEN/binary,
+          SessIdLen, SessionId/binary,
+          (iolist_to_binary(CipherSuites))/binary,
+          1, 0,
+          ExtLen:?u16, ExtBin/binary>>
+    end,
+    
     FakeRandom0 = binary:copy(<<0>>, ?DIGEST_LEN),
     Hello0 = Pack(FakeRandom0),
     Digest = hmac(sha256, Secret, Hello0),
@@ -1193,8 +1146,36 @@ make_client_hello(Timestamp, SessionId, Secret, SniDomain) when byte_size(Sessio
     Pack(FakeRandom).
 
 %% ============================================================================
-%% @doc Generate Fake-TLS "ClientHello" with PSK support.
-%% @end
+%% get_cached_hello/2, cache_hello/3, update_hello_timestamp/2
+%% ============================================================================
+-spec get_cached_hello(binary(), binary()) -> binary() | undefined.
+get_cached_hello(Secret, SniDomain) ->
+    case get(?HELLO_CACHE) of
+        #{ {Secret, SniDomain} := Hello } -> Hello;
+        _ -> undefined
+    end.
+
+-spec cache_hello(binary(), binary(), binary()) -> ok.
+cache_hello(Secret, SniDomain, Hello) ->
+    Cache = get(?HELLO_CACHE, #{}),
+    NewCache = case maps:size(Cache) >= ?HELLO_CACHE_SIZE of
+        true ->
+            {OldKey, _} = lists:last(lists:keysort(1, maps:to_list(Cache))),
+            maps:remove(OldKey, Cache);
+        false ->
+            Cache
+    end,
+    put(?HELLO_CACHE, maps:put({Secret, SniDomain}, Hello, NewCache)),
+    ok.
+
+-spec update_hello_timestamp(binary(), non_neg_integer()) -> binary().
+update_hello_timestamp(Hello, Timestamp) ->
+    Pos = ?DIGEST_POS + ?DIGEST_LEN - 4,
+    <<Head:Pos/binary, _:4/binary, Tail/binary>> = Hello,
+    <<Head/binary, Timestamp:32/unsigned-little, Tail/binary>>.
+
+%% ============================================================================
+%% make_client_hello_with_psk/3, make_client_hello_with_psk/5
 %% ============================================================================
 -spec make_client_hello_with_psk(Secret :: binary(), SniDomain :: binary(), 
                                    PskIdentity :: binary()) -> binary().
@@ -1208,10 +1189,8 @@ make_client_hello_with_psk(Secret, SniDomain, PskIdentity) ->
 make_client_hello_with_psk(Timestamp, SessionId, Secret, SniDomain, PskIdentity) ->
     Profile = random_tls_profile(),
     
-    %% PSK Extension
     PskExt = build_psk_extension(PskIdentity, Secret, SessionId, Timestamp),
     
-    %% Other extensions
     CipherSuites = build_cipher_suites(Profile),
     SNI = make_sni([SniDomain]),
     SigAlgos = build_sig_algos(Profile),
@@ -1246,7 +1225,7 @@ make_client_hello_with_psk(Timestamp, SessionId, Secret, SniDomain, PskIdentity)
     
     NonEmpty = [E || E <- ExtensionsBase, E =/= <<>>],
     Extensions = case maps:get(extensions_order_randomized, Profile, false) of
-        true -> shuffle_list(NonEmpty);
+        true -> fast_shuffle(NonEmpty);
         false -> NonEmpty
     end,
     
@@ -1267,10 +1246,8 @@ make_client_hello_with_psk(Timestamp, SessionId, Secret, SniDomain, PskIdentity)
           ExtLen:?u16, ExtBin/binary>>
     end,
     
-    %% Simulate timing
-    simulate_timing(Profile, handshake),
+    simulate_timing(Profile),
     
-    %% Compute digest
     FakeRandom0 = binary:copy(<<0>>, ?DIGEST_LEN),
     Hello0 = Pack(FakeRandom0),
     Digest = hmac(sha256, Secret, Hello0),
@@ -1279,8 +1256,33 @@ make_client_hello_with_psk(Timestamp, SessionId, Secret, SniDomain, PskIdentity)
     Pack(FakeRandom).
 
 %% ============================================================================
-%% @doc Parses "ServerHello" (the one produced by from_client_hello/2).
-%% @end
+%% build_psk_extension/4, compute_psk_binder/4
+%% ============================================================================
+-spec build_psk_extension(binary(), binary(), binary(), non_neg_integer()) -> iodata().
+build_psk_extension(Identity, Secret, SessionId, Timestamp) ->
+    IdentityLen = byte_size(Identity),
+    ObsoleteAge = 0,
+    
+    Binder = compute_psk_binder(Secret, SessionId, Timestamp, Identity),
+    BinderLen = byte_size(Binder),
+    
+    IdentitiesData = <<IdentityLen:?u16, Identity/binary, ObsoleteAge:32/unsigned>>,
+    IdentitiesLen = byte_size(IdentitiesData),
+    BindersData = <<BinderLen:?u16, Binder/binary>>,
+    BindersLen = byte_size(BindersData),
+    
+    ExtData = <<IdentitiesLen:?u16, IdentitiesData/binary,
+                BindersLen:?u16, BindersData/binary>>,
+    ExtLen = byte_size(ExtData),
+    
+    <<?EXT_PSK:?u16, ExtLen:?u16, ExtData/binary>>.
+
+compute_psk_binder(Secret, SessionId, Timestamp, Identity) ->
+    Context = <<SessionId/binary, Timestamp:32/unsigned-little, Identity/binary>>,
+    crypto:mac(hmac, sha256, Secret, Context).
+
+%% ============================================================================
+%% parse_server_hello/1
 %% ============================================================================
 parse_server_hello(<<?TLS_REC_HANDSHAKE, ?TLS_12_VERSION, HSLen:?u16, Handshake:HSLen/binary,
                      ?TLS_REC_CHANGE_CIPHER, ?TLS_12_VERSION, CCLen:?u16, ChangeCipher:CCLen/binary,
@@ -1299,6 +1301,9 @@ parse_server_hello(<<16#15, _/binary>>) ->
 parse_server_hello(_) ->
     {error, not_proxy_response}.
 
+%% ============================================================================
+%% tls_records_complete/2
+%% ============================================================================
 -spec tls_records_complete(binary(), non_neg_integer()) -> boolean().
 tls_records_complete(_B, 0) ->
     true;
@@ -1309,9 +1314,8 @@ tls_records_complete(_B, _N) ->
     false.
 
 %% ============================================================================
-%% Data stream codec
+%% new/0, try_decode_packet/2, decode_all/2, decode_all/3
 %% ============================================================================
-
 -spec new() -> codec().
 new() ->
     #st{}.
@@ -1341,8 +1345,7 @@ decode_all(Bin, Acc, St0) ->
     end.
 
 %% ============================================================================
-%% @doc Encode packet with variable size based on profile
-%% @end
+%% encode_packet/2
 %% ============================================================================
 -spec encode_packet(binary(), codec()) -> {iodata(), codec()}.
 encode_packet(Bin, #st{current_profile = Profile} = St) ->
@@ -1355,6 +1358,9 @@ encode_packet(Bin, #st{current_profile = Profile} = St) ->
             {encode_as_frames_with_limit(Bin, MaxSize), St}
     end.
 
+%% ============================================================================
+%% encode_as_frames/1, encode_as_frames_with_limit/2
+%% ============================================================================
 encode_as_frames(Bin) when byte_size(Bin) =< ?MAX_OUT_PACKET_SIZE ->
     as_tls_data_frame(Bin);
 encode_as_frames(<<Chunk:?MAX_OUT_PACKET_SIZE/binary, Tail/binary>>) ->
@@ -1365,6 +1371,9 @@ encode_as_frames_with_limit(Bin, Limit) when byte_size(Bin) =< Limit ->
 encode_as_frames_with_limit(<<Chunk:Limit/binary, Tail/binary>>, Limit) ->
     [as_tls_data_frame(Chunk) | encode_as_frames_with_limit(Tail, Limit)].
 
+%% ============================================================================
+%% as_tls_data_frame/1, as_tls_frame/2
+%% ============================================================================
 as_tls_data_frame(Bin) ->
     as_tls_frame(?TLS_REC_DATA, Bin).
 
@@ -1373,6 +1382,9 @@ as_tls_frame(Type, Data) ->
     Size = iolist_size(Data),
     [<<Type, ?TLS_12_VERSION, Size:?u16>> | Data].
 
+%% ============================================================================
+%% hmac/3 - با پشتیبانی از نسخه‌های مختلف OTP
+%% ============================================================================
 -if(?OTP_RELEASE >= 23).
 hmac(Algo, Key, Str) ->
     crypto:mac(hmac, Algo, Key, Str).

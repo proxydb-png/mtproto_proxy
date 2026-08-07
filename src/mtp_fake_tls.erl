@@ -3,7 +3,8 @@
 %%% @doc
 %%% Fake TLS 'CBC' stream codec
 %%% Enhanced with deep fingerprint randomization, wildcard domain support,
-%%% Replay Attack protection, and performance optimizations (iolists, caching).
+%%% Replay Attack protection, performance optimizations (iolists, caching),
+%%% and Session Ticket + OCSP Stapling support for Telegram X compatibility.
 %%% @end
 %%% Created : 24 Jul 2019 by sergey <me@seriyps.ru>
 
@@ -75,6 +76,8 @@
 -define(EXT_SNI_HOST_NAME, 0).
 -define(EXT_KEY_SHARE, 51).
 -define(EXT_SUPPORTED_VERSIONS, 43).
+-define(EXT_SESSION_TICKET, 35).
+-define(EXT_STATUS_REQUEST, 5).
 
 %% حداکثر اختلاف زمانی مجاز بین Timestamp درون ClientHello و زمان فعلی سرور (به ثانیه)
 -define(TIMESTAMP_TOLERANCE_SECONDS, 300).
@@ -346,7 +349,7 @@ urlencode_digit(D)  -> D.
 
 %% ============================================================================
 %% @doc Parse fake-TLS "ClientHello" and generate "ServerHello + ChangeCipher + ApplicationData"
-%% Version WITH domain checking and timestamp validation.
+%% Version WITH domain checking, timestamp validation, Session Ticket & OCSP support.
 %% @end
 %% ============================================================================
 -spec from_client_hello(binary(), binary(), [binary()]) ->
@@ -381,6 +384,12 @@ from_client_hello(Data, Secret, AllowedDomains) ->
             end
     end,
 
+    %% Check if client requested Session Ticket or OCSP Stapling
+    HasSessionTicket = lists:keymember(?EXT_SESSION_TICKET, 1, Extensions),
+    HasOcspStapling = lists:keymember(?EXT_STATUS_REQUEST, 1, Extensions),
+    ?LOG_DEBUG("Client capabilities - SessionTicket: ~p, OCSP: ~p", 
+               [HasSessionTicket, HasOcspStapling]),
+
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
         crypto:exor(ClientDigest, ServerDigest),
@@ -401,14 +410,16 @@ from_client_hello(Data, Secret, AllowedDomains) ->
         end,
 
     KeyShare = make_key_share(Extensions),
-    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare),
+    SrvHello0 = make_srv_hello(binary:copy(<<0>>, ?DIGEST_LEN), SessionId, KeyShare,
+                               HasSessionTicket, HasOcspStapling),
     FakeHttpData = crypto:strong_rand_bytes(rand:uniform(256)),
     Response0 = [_, CC, DD] =
         [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello0),
          as_tls_frame(?TLS_REC_CHANGE_CIPHER, [1]),
          as_tls_frame(?TLS_REC_DATA, FakeHttpData)],
     SrvHelloDigest = hmac(sha256, Secret, [ClientDigest | Response0]),
-    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare),
+    SrvHello = make_srv_hello(SrvHelloDigest, SessionId, KeyShare,
+                              HasSessionTicket, HasOcspStapling),
     Response = [as_tls_frame(?TLS_REC_HANDSHAKE, SrvHello),
                 CC,
                 DD],
@@ -535,11 +546,30 @@ make_key_share(Exts) ->
     end.
 
 make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
+    make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, false, false).
+
+make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}, 
+               HasSessionTicket, HasOcspStapling) ->
     KeyShareEntity = <<KeyShareGroup:?u16, (byte_size(KeyShareKey)):?u16, KeyShareKey/binary>>,
-    Extensions =
-        [<<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16>>,
-         KeyShareEntity,
-         <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>],
+    
+    %% Base extensions (always present)
+    ExtensionsBase = [
+        <<?EXT_KEY_SHARE:?u16, (byte_size(KeyShareEntity)):?u16, KeyShareEntity/binary>>,
+        <<?EXT_SUPPORTED_VERSIONS:?u16, 2:?u16, ?TLS_13_VERSION>>
+    ],
+    
+    %% Add Session Ticket extension if client requested it
+    ExtensionsWithTicket = case HasSessionTicket of
+        true -> ExtensionsBase ++ [<<?EXT_SESSION_TICKET:?u16, 0:?u16>>];
+        false -> ExtensionsBase
+    end,
+    
+    %% Add OCSP Stapling extension if client requested it
+    ExtensionsFinal = case HasOcspStapling of
+        true -> ExtensionsWithTicket ++ [<<?EXT_STATUS_REQUEST:?u16, 0:?u16>>];
+        false -> ExtensionsWithTicket
+    end,
+    
     SessionSize = byte_size(SessionId),
     Payload = [<<?TLS_12_VERSION,
                  Digest:?DIGEST_LEN/binary,
@@ -547,8 +577,8 @@ make_srv_hello(Digest, SessionId, {KeyShareGroup, KeyShareKey}) ->
                  SessionId:SessionSize/binary,
                  ?TLS_CIPHERSUITE,
                  0,
-                 (iolist_size(Extensions)):?u16>>
-                   | Extensions],
+                 (iolist_size(ExtensionsFinal)):?u16>>
+                   | ExtensionsFinal],
     [<<?TLS_TAG_SRV_HELLO, (iolist_size(Payload)):?u24>> | Payload].
 
 %% ============================================================================

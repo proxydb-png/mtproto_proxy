@@ -360,6 +360,7 @@ init(AllowedDomains) ->
     put(?CACHE_KEY_PROFILES_TAB, Tab),
     
     put(?CACHE_KEY_METRICS, #{}),
+    put(?HELLO_CACHE, #{}),
     
     ?LOG_INFO("Fake-TLS profiles and domain cache initialized successfully. ~p profiles loaded.",
               [length(Profiles)]),
@@ -1151,13 +1152,16 @@ build_client_hello(Timestamp, SessionId, Secret, SniDomain, Profile) ->
 -spec get_cached_hello(binary(), binary()) -> binary() | undefined.
 get_cached_hello(Secret, SniDomain) ->
     case get(?HELLO_CACHE) of
-        #{ {Secret, SniDomain} := Hello } -> Hello;
-        _ -> undefined
+        undefined -> undefined;
+        Cache -> maps:get({Secret, SniDomain}, Cache, undefined)
     end.
 
 -spec cache_hello(binary(), binary(), binary()) -> ok.
 cache_hello(Secret, SniDomain, Hello) ->
-    Cache = get(?HELLO_CACHE, #{}),
+    Cache = case get(?HELLO_CACHE) of
+        undefined -> #{};
+        C -> C
+    end,
     NewCache = case maps:size(Cache) >= ?HELLO_CACHE_SIZE of
         true ->
             {OldKey, _} = lists:last(lists:keysort(1, maps:to_list(Cache))),

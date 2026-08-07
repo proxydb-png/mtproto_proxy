@@ -237,7 +237,7 @@
 init(AllowedDomains) ->
     %% 1. Domain Caching
     {ExactMap, WildcardList} = categorize_domains(AllowedDomains, #{}, []),
-    DomainCache = #{exact => ExactMap, wildcard => WildcardList},
+    DomainCache = #{exact => ExactMap, wildcard => WildcardList, allowed_list => AllowedDomains},
     put(?CACHE_KEY_DOMAINS, DomainCache),
 
     %% 2. Profile Pre-computation
@@ -264,12 +264,20 @@ categorize_domains([Domain | T], ExactMap, Wildcards) ->
 %% Uses cached domain data for O(1) exact lookup and fast wildcard matching.
 %% @end
 %% ============================================================================
--spec is_domain_allowed(Domain :: binary()) -> boolean().
-is_domain_allowed(Domain) when is_binary(Domain) ->
-    #{exact := ExactMap, wildcard := Wildcards} = get(?CACHE_KEY_DOMAINS),
-    case maps:is_key(Domain, ExactMap) of
-        true -> true;
-        false -> check_wildcard(Domain, Wildcards)
+-spec is_domain_allowed(Domain :: binary(), AllowedDomains :: [binary()]) -> boolean().
+is_domain_allowed(Domain, AllowedDomains) when is_binary(Domain) ->
+    case get(?CACHE_KEY_DOMAINS) of
+        #{exact := ExactMap, wildcard := Wildcards} ->
+            case maps:is_key(Domain, ExactMap) of
+                true -> true;
+                false -> check_wildcard(Domain, Wildcards)
+            end;
+        undefined ->
+            {ExactMap, Wildcards} = categorize_domains(AllowedDomains, #{}, []),
+            case maps:is_key(Domain, ExactMap) of
+                true -> true;
+                false -> check_wildcard(Domain, Wildcards)
+            end
     end.
 
 %% ============================================================================
@@ -280,17 +288,17 @@ is_domain_allowed(Domain) when is_binary(Domain) ->
 -spec check_wildcard(Domain :: binary(), [binary()]) -> boolean().
 check_wildcard(_Domain, []) -> false;
 check_wildcard(Domain, [Suffix | T]) ->
-    %% We want to match "sub.example.com" against "*.example.com"
-    %% We do this by checking if the domain ends with ".Suffix"
     SuffixWithDot = <<".", Suffix/binary>>,
     SuffixLen = byte_size(SuffixWithDot),
     DomainLen = byte_size(Domain),
-    %% 1. The domain must be longer than the suffix (e.g., "x.example.com" > 11)
-    %% 2. The part right before the suffix must be the dot
     case DomainLen > SuffixLen of
         true ->
-            <<_:binary/unit:8, Tail:SuffixLen/binary>> = Domain,
-            Tail =:= SuffixWithDot;
+            StartPos = DomainLen - SuffixLen,
+            <<_Head:StartPos/binary, Tail:SuffixLen/binary>> = Domain,
+            case Tail =:= SuffixWithDot of
+                true -> true;
+                false -> check_wildcard(Domain, T)
+            end;
         false ->
             check_wildcard(Domain, T)
     end.
@@ -303,8 +311,6 @@ check_wildcard(Domain, [Suffix | T]) ->
 %% ============================================================================
 -spec precompute_profile(map()) -> map().
 precompute_profile(Profile) ->
-    %% We pre-build the static parts of the extensions that don't change per-connection.
-    %% This is a significant performance win.
     StaticExtensions = [
         ec_point_formats_ext(Profile),
         compress_certificate_ext(Profile),
